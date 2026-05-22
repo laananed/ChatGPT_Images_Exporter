@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Image Downloader</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>ChatGPT 图片下载</h1>
+        <p>在 ChatGPT 图片页面打开后使用</p>
+      </header>
+
+      <form id="download-form">
+        <label>
+          <span>下载文件夹</span>
+          <input id="folder" type="text" value="ChatGPT Images" maxlength="80">
+        </label>
+
+        <div class="grid">
+          <label>
+            <span>滚动次数</span>
+            <input id="max-scrolls" type="number" min="0" max="250" value="30">
+          </label>
+
+          <label>
+            <span>下载间隔 ms</span>
+            <input id="delay-ms" type="number" min="0" max="5000" step="100" value="400">
+          </label>
+        </div>
+
+        <button id="start" type="submit">扫描并下载</button>
+      </form>
+
+      <section id="status" aria-live="polite"></section>
+
+      <section class="logs" aria-label="诊断日志">
+        <div class="log-header">
+          <h2>诊断日志</h2>
+          <div class="log-actions">
+            <button id="copy-logs" class="secondary" type="button">复制</button>
+            <button id="clear-logs" class="secondary" type="button">清空</button>
+          </div>
+        </div>
+        <pre id="log-list">暂无日志</pre>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
