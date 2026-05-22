@@ -294,10 +294,14 @@ function jobMetrics(job = {}) {
     : null;
 
   return {
+    scanListItems: numberMetric(job.scanListItems ?? report?.scanListItems ?? report?.scanList),
     scannedItems: numberMetric(job.scannedItems ?? job.scanned ?? report?.scannedItems),
     resolvedCardItems: numberMetric(job.resolvedCardItems ?? report?.resolvedCardItems),
     resolvedItems: numberMetric(job.resolvedItems ?? job.matched ?? report?.resolvedItems),
     deduplicatedItems: numberMetric(job.deduplicatedItems ?? report?.deduplicatedItems),
+    skippedItems: numberMetric(job.skippedItems ?? report?.skippedItems),
+    directMerged: directResourceMetric(job.directResourceSummary ?? report?.directResourceSummary, "merged"),
+    directAppended: directResourceMetric(job.directResourceSummary ?? report?.directResourceSummary, "appended"),
     parseFailures: numberMetric(job.parseFailureCount ?? job.detailFailureCount ?? report?.parseFailures),
     qualityFailures: numberMetric(job.qualityFailureCount ?? job.qualityFailures ?? report?.qualityFailures),
     submittedDownloads: numberMetric(job.submittedDownloads ?? job.downloadStarted ?? report?.submittedDownloads),
@@ -314,6 +318,14 @@ function numberMetric(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
+function directResourceMetric(summary, key) {
+  if (!summary || typeof summary !== "object") {
+    return 0;
+  }
+
+  return numberMetric(summary[key]);
+}
+
 function formatMetricsLine(metrics) {
   const resolvedCardItems = metrics.resolvedCardItems
     || Math.max(metrics.scannedItems - metrics.parseFailures, metrics.resolvedItems);
@@ -321,11 +333,15 @@ function formatMetricsLine(metrics) {
     || Math.max(resolvedCardItems - metrics.resolvedItems, 0);
 
   return [
+    `scanList ${metrics.scanListItems || metrics.scannedItems}`,
     `质量失败 ${metrics.qualityFailures} 张`,
     `扫描 ${metrics.scannedItems} 张`,
     `解析成功 ${resolvedCardItems} 张`,
     `解析失败 ${metrics.parseFailures} 张`,
     `唯一原图 ${metrics.resolvedItems} 张`,
+    `skipped ${metrics.skippedItems}`,
+    `direct merged ${metrics.directMerged}`,
+    `direct appended ${metrics.directAppended}`,
     `已去重 ${deduplicatedItems} 张`,
     `提交下载 ${metrics.submittedDownloads} 张`,
     `下载提交失败 ${metrics.downloadFailures} 张`
@@ -376,8 +392,10 @@ function formatFailureReportForCopy(report) {
   const parseFailures = Array.isArray(report.parseFailures) ? report.parseFailures : [];
   const qualityFailures = Array.isArray(report.qualityFailures) ? report.qualityFailures : [];
   const downloadFailures = Array.isArray(report.downloadFailures) ? report.downloadFailures : [];
+  const scanList = Array.isArray(report.scanList) ? report.scanList : [];
+  const skippedItems = Array.isArray(report.skippedItems) ? report.skippedItems : [];
 
-  if (!parseFailures.length && !qualityFailures.length && !downloadFailures.length) {
+  if (!parseFailures.length && !qualityFailures.length && !downloadFailures.length && !skippedItems.length && !scanList.length) {
     return "";
   }
 
@@ -387,11 +405,15 @@ function formatFailureReportForCopy(report) {
     startedAt: report.startedAt || null,
     endedAt: report.endedAt || null,
     scannedItems: numberMetric(report.scannedItems),
+    scanListTotal: scanList.length,
     resolvedCardItems: numberMetric(report.resolvedCardItems),
     resolvedItems: numberMetric(report.resolvedItems),
     deduplicatedItems: numberMetric(report.deduplicatedItems),
     deduplicatedItemSamples: Array.isArray(report.deduplicatedItemSamples) ? report.deduplicatedItemSamples : [],
     submittedDownloads: numberMetric(report.submittedDownloads),
+    directResourceSummary: report.directResourceSummary || null,
+    scanList,
+    skippedItems,
     parseFailures,
     qualityFailures,
     downloadFailures

@@ -150,6 +150,9 @@ async function startImageJob(payload = {}) {
     total: 0,
     downloadStarted: 0,
     submittedDownloads: 0,
+    scanListItems: 0,
+    skippedItems: 0,
+    directResourceSummary: null,
     qualityFailures: 0,
     qualityFailureCount: 0,
     downloadFailures: 0,
@@ -173,6 +176,9 @@ async function startImageJob(payload = {}) {
     qualityFailures: [],
     deduplicatedItems: 0,
     deduplicatedItemSamples: [],
+    scanList: [],
+    skippedItems: [],
+    directResourceSummary: null,
     downloadFailures: []
   }));
   await appendJobLog({
@@ -206,6 +212,9 @@ async function runImageJob(jobId, tabId, settings) {
   let parseFailures = [];
   let qualityFailures = [];
   let downloadFailures = [];
+  let scanList = [];
+  let skippedItems = [];
+  let directResourceSummary = null;
 
   try {
     await ensureContentScript(tabId);
@@ -238,6 +247,9 @@ async function runImageJob(jobId, tabId, settings) {
     resolvedCardItems = Number(scanResponse.result?.resolvedCardItems ?? Math.max(scannedItems - parseFailures.length, resolvedItems));
     deduplicatedItems = Number(scanResponse.result?.deduplicatedItems ?? Math.max(resolvedCardItems - resolvedItems, 0));
     deduplicatedItemSamples = normalizeFailureItems(scanResponse.result?.deduplicatedItemSamples, "dedupe");
+    scanList = normalizeScanListItems(scanResponse.result?.scanList);
+    skippedItems = normalizeFailureItems(scanResponse.result?.skippedItems, "skip");
+    directResourceSummary = sanitizeReportDiagnostic(scanResponse.result?.directResourceSummary, 3000);
     await appendJobLog({
       jobId,
       level: matched ? "info" : "warn",
@@ -250,7 +262,10 @@ async function runImageJob(jobId, tabId, settings) {
         resolvedCardItems,
         detailFailureCount,
         parseFailures: parseFailures.length,
-        deduplicatedItems
+        deduplicatedItems,
+        scanListItems: scanList.length,
+        skippedItems: skippedItems.length,
+        directResources: directResourceSummary
       }
     });
     await saveJobReport(createJobReport({
@@ -265,6 +280,9 @@ async function runImageJob(jobId, tabId, settings) {
       submittedDownloads,
       parseFailures,
       qualityFailures,
+      scanList,
+      skippedItems,
+      directResourceSummary,
       downloadFailures
     }));
     await mergeJobStatus(jobId, {
@@ -279,6 +297,9 @@ async function runImageJob(jobId, tabId, settings) {
       resolvedItems,
       deduplicatedItems,
       parseFailureCount: parseFailures.length || Number(detailFailureCount || 0),
+      scanListItems: scanList.length,
+      skippedItems: skippedItems.length,
+      directResourceSummary,
       current: matched,
       total: scanned
     });
@@ -325,6 +346,9 @@ async function runImageJob(jobId, tabId, settings) {
       submittedDownloads,
       parseFailures,
       qualityFailures,
+      scanList,
+      skippedItems,
+      directResourceSummary,
       downloadFailures
     });
     await saveJobReport(report);
@@ -350,6 +374,9 @@ async function runImageJob(jobId, tabId, settings) {
       resolvedItems,
       deduplicatedItems,
       parseFailureCount: parseFailures.length,
+      scanListItems: scanList.length,
+      skippedItems: skippedItems.length,
+      directResourceSummary,
       qualityFailures: qualityFailures.length,
       qualityFailureCount: qualityFailures.length,
       runId: downloadResult.runId,
@@ -371,6 +398,9 @@ async function runImageJob(jobId, tabId, settings) {
       submittedDownloads,
       parseFailures,
       qualityFailures,
+      scanList,
+      skippedItems,
+      directResourceSummary,
       downloadFailures,
       diagnostic: {
         reason: error?.message || String(error),
@@ -395,6 +425,9 @@ async function runImageJob(jobId, tabId, settings) {
       resolvedItems,
       deduplicatedItems,
       parseFailureCount: parseFailures.length,
+      scanListItems: scanList.length,
+      skippedItems: skippedItems.length,
+      directResourceSummary,
       submittedDownloads,
       qualityFailures: qualityFailures.length,
       qualityFailureCount: qualityFailures.length,
@@ -502,6 +535,9 @@ async function cancelImageJob() {
     parseFailures: [],
     qualityFailures: [],
     deduplicatedItemSamples: [],
+    scanList: [],
+    skippedItems: [],
+    directResourceSummary: null,
     downloadFailures: []
   }));
   await appendJobLog({
@@ -532,6 +568,9 @@ async function getJobStatus() {
     total: 0,
     downloadStarted: 0,
     submittedDownloads: 0,
+    scanListItems: 0,
+    skippedItems: 0,
+    directResourceSummary: null,
     qualityFailures: 0,
     qualityFailureCount: 0,
     downloadFailures: 0,
@@ -580,6 +619,9 @@ function createJobReport({
   parseFailures = [],
   qualityFailures = [],
   downloadFailures = [],
+  scanList = [],
+  skippedItems = [],
+  directResourceSummary = null,
   diagnostic = null
 } = {}) {
   return {
@@ -596,6 +638,9 @@ function createJobReport({
     parseFailures: normalizeFailureItems(parseFailures, "resolve"),
     qualityFailures: normalizeFailureItems(qualityFailures, "quality"),
     downloadFailures: normalizeFailureItems(downloadFailures, "download"),
+    scanList: normalizeScanListItems(scanList),
+    skippedItems: normalizeFailureItems(skippedItems, "skip"),
+    directResourceSummary: sanitizeReportDiagnostic(directResourceSummary, 3000),
     diagnostic: sanitizeReportDiagnostic(diagnostic)
   };
 }
@@ -612,7 +657,49 @@ function summarizeJobReport(report = {}) {
     parseFailures: Array.isArray(report.parseFailures) ? report.parseFailures.length : 0,
     qualityFailures: Array.isArray(report.qualityFailures) ? report.qualityFailures.length : 0,
     downloadFailures: Array.isArray(report.downloadFailures) ? report.downloadFailures.length : 0,
+    scanListItems: Array.isArray(report.scanList) ? report.scanList.length : 0,
+    skippedItems: Array.isArray(report.skippedItems) ? report.skippedItems.length : 0,
+    directResourceSummary: report.directResourceSummary || null,
     storageKeys: [JOB_REPORT_KEY, JOB_MANIFEST_KEY]
+  };
+}
+
+function normalizeScanListItems(items) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item, fallbackIndex) => normalizeScanListItem(item, fallbackIndex + 1))
+    .filter(Boolean);
+}
+
+function normalizeScanListItem(item, fallbackIndex) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const scanIndex = Number(item.scanIndex || item.index || fallbackIndex || 0);
+  const pageOrder = Number(item.pageOrder || scanIndex || fallbackIndex || 0);
+
+  return {
+    scanIndex,
+    pageOrder,
+    imageKey: truncateText(item.imageKey || buildReportImageKey(item, scanIndex), 80),
+    thumbnailUrl: normalizeFailureUrlSummary(item.thumbnailUrl || item.thumbnail || item.url),
+    prompt: truncateText(item.prompt || item.alt || "", 240),
+    date: truncateText(item.date || "", 80),
+    position: sanitizeReportDiagnostic(item.position, 1000),
+    source: truncateText(item.source || "", 80),
+    status: truncateText(item.status || "", 80),
+    reason: truncateText(item.reason || "", 200),
+    resolvedUrl: normalizeFailureUrlSummary(item.resolvedUrl || item.resolvedOriginalUrl || ""),
+    directResourceDisposition: truncateText(item.directResourceDisposition || "", 80),
+    directSource: truncateText(item.directSource || "", 80),
+    directSources: Array.isArray(item.directSources)
+      ? item.directSources.map((source) => truncateText(source, 80)).slice(0, 20)
+      : [],
+    directResourceCount: Number(item.directResourceCount || 0)
   };
 }
 
@@ -631,7 +718,9 @@ function normalizeFailureItem(item, fallbackStage = "", fallbackIndex = 0) {
     return null;
   }
 
-  const index = Number(item.index || fallbackIndex || 0);
+  const index = Number(item.index || item.scanIndex || fallbackIndex || 0);
+  const scanIndex = Number(item.scanIndex || index || fallbackIndex || 0);
+  const pageOrder = Number(item.pageOrder || scanIndex || index || fallbackIndex || 0);
   const diagnostic = item.diagnostic !== undefined
     ? item.diagnostic
     : diagnosticFromFailureItem(item);
@@ -641,10 +730,13 @@ function normalizeFailureItem(item, fallbackStage = "", fallbackIndex = 0) {
 
   return {
     index,
+    scanIndex,
+    pageOrder,
     imageKey: truncateText(item.imageKey || buildReportImageKey(item, index), 80),
     thumbnailUrl: normalizeFailureUrlSummary(item.thumbnailUrl || item.thumbnail || item.url),
     prompt: truncateText(item.prompt || item.alt || "", 240),
     date: truncateText(item.date || "", 80),
+    source: truncateText(item.source || "", 80),
     reason: truncateText(item.reason || item.error || "unknown-failure", 200),
     stage: truncateText(item.stage || fallbackStage || "", 80),
     diagnostic: sanitizeReportDiagnostic(diagnostic),
@@ -658,12 +750,20 @@ function diagnosticFromFailureItem(item) {
   const diagnostic = {};
   const skipKeys = new Set([
     "index",
+    "scanIndex",
+    "pageOrder",
     "imageKey",
     "thumbnailUrl",
     "thumbnail",
     "prompt",
     "alt",
     "date",
+    "source",
+    "position",
+    "directResourceDisposition",
+    "directSource",
+    "directSources",
+    "directResourceCount",
     "reason",
     "stage",
     "diagnostic",
@@ -685,6 +785,8 @@ function diagnosticFromFailureItem(item) {
 
 function buildDownloadFailureItem({
   index,
+  scanIndex = 0,
+  pageOrder = 0,
   image = {},
   imageKey = "",
   reason = "",
@@ -694,10 +796,13 @@ function buildDownloadFailureItem({
 } = {}) {
   return normalizeFailureItem({
     index,
+    scanIndex: scanIndex || image.scanIndex || index,
+    pageOrder: pageOrder || image.pageOrder || image.scanIndex || index,
     imageKey,
     thumbnailUrl: image.thumbnailUrl || image.thumbnail || image.url || "",
     prompt: image.prompt || image.alt || "",
     date: image.date || "",
+    source: image.source || "",
     reason,
     stage,
     diagnostic,
@@ -886,6 +991,8 @@ async function downloadImages(payload) {
     }
 
     const itemNumber = index + 1;
+    const scanIndex = normalizedScanIndex(image, itemNumber);
+    const pageOrder = Number(image.pageOrder || scanIndex || itemNumber);
     const imageKey = buildImageKey(image);
     const shortHash = imageKeyToShortHash(imageKey);
     const urlSummary = summarizeDownloadUrl(image.url);
@@ -897,9 +1004,12 @@ async function downloadImages(payload) {
       message: "已解析候选 URL",
       detail: {
         index: itemNumber,
+        scanIndex,
+        pageOrder,
         total: images.length,
         imageKey,
         shortHash,
+        source: image.source || "",
         runFolder,
         url: urlSummary,
         needsBlobPreparation: shouldPrepareImageInContent(image.url)
@@ -918,6 +1028,8 @@ async function downloadImages(payload) {
       if (!target.ok) {
         const failureItem = buildDownloadFailureItem({
           index: itemNumber,
+          scanIndex,
+          pageOrder,
           image,
           imageKey,
           reason: target.reason,
@@ -944,9 +1056,12 @@ async function downloadImages(payload) {
           message: "下载前取图失败，未提交下载任务",
           detail: {
             index: itemNumber,
+            scanIndex,
+            pageOrder,
             total: images.length,
             imageKey,
             shortHash,
+            source: image.source || "",
             runFolder,
             reason: target.reason,
             status: target.status || 0,
@@ -968,9 +1083,12 @@ async function downloadImages(payload) {
         message: "quality-accepted: image passed original-quality gate",
         detail: {
           index: itemNumber,
+          scanIndex,
+          pageOrder,
           total: images.length,
           imageKey,
           shortHash,
+          source: image.source || "",
           runFolder,
           quality: target.quality,
           sourceUrl: target.sourceUrl ? summarizeDownloadUrl(target.sourceUrl) : null,
@@ -999,6 +1117,8 @@ async function downloadImages(payload) {
       if (!submitted.ok) {
         failures.push(buildDownloadFailureItem({
           index: itemNumber,
+          scanIndex,
+          pageOrder,
           image,
           imageKey,
           reason: submitted.reason,
@@ -1019,9 +1139,12 @@ async function downloadImages(payload) {
           message: "图片下载任务提交失败",
           detail: {
             index: itemNumber,
+            scanIndex,
+            pageOrder,
             total: images.length,
             imageKey,
             shortHash,
+            source: image.source || "",
             runFolder,
             filename,
             reason: submitted.reason,
@@ -1042,10 +1165,13 @@ async function downloadImages(payload) {
         message: "submit-original-download: browser download task submitted",
         detail: {
           index: itemNumber,
+          scanIndex,
+          pageOrder,
           total: images.length,
           filename,
           imageKey,
           shortHash,
+          source: image.source || "",
           runId,
           runFolder,
           downloadId: submitted.downloadId,
@@ -1067,10 +1193,13 @@ async function downloadImages(payload) {
         message: "已成功提交图片下载任务",
         detail: {
           index: itemNumber,
+          scanIndex,
+          pageOrder,
           total: images.length,
           filename,
           imageKey,
           shortHash,
+          source: image.source || "",
           runId,
           runFolder,
           downloadId: submitted.downloadId,
@@ -1090,6 +1219,8 @@ async function downloadImages(payload) {
       const reason = error?.message || String(error);
       failures.push(buildDownloadFailureItem({
         index: itemNumber,
+        scanIndex,
+        pageOrder,
         image,
         imageKey,
         reason,
@@ -1106,9 +1237,12 @@ async function downloadImages(payload) {
         message: "下载任务处理失败",
         detail: {
           index: itemNumber,
+          scanIndex,
+          pageOrder,
           total: images.length,
           imageKey,
           shortHash,
+          source: image.source || "",
           runFolder,
           reason,
           url: urlSummary
@@ -1419,11 +1553,19 @@ async function getPreparedImageDataUrl(tabId, downloadUrl) {
 }
 
 function buildBaseName(image, index, shortHash, fallbackDate) {
+  const prefixIndex = normalizedScanIndex(image, index);
   const datePrefix = sanitizeDateSegment(image.date) || fallbackDate || "unknown-date";
   const title = sanitizePromptForFileName(image.prompt || image.alt || DEFAULT_PROMPT_NAME);
   const safeHash = sanitizePathSegment(shortHash, "image").slice(0, 16);
 
-  return `${String(index).padStart(4, "0")}-${datePrefix}-${safeHash}-${title}`;
+  return `${String(prefixIndex).padStart(4, "0")}-${datePrefix}-${safeHash}-${title}`;
+}
+
+function normalizedScanIndex(image, fallbackIndex) {
+  const scanIndex = Number(image?.scanIndex);
+  return Number.isFinite(scanIndex) && scanIndex > 0
+    ? scanIndex
+    : Number(fallbackIndex) || 0;
 }
 
 function buildRunContext({ folder, accountLabel, startedAt, jobId, runId }) {
@@ -1451,6 +1593,11 @@ function buildRunId(timestamp, jobId) {
 }
 
 function buildImageKey(image) {
+  const providedKey = sanitizeProvidedImageKey(image?.imageKey);
+  if (providedKey) {
+    return providedKey;
+  }
+
   const keyInput = [
     canonicalizeImageUrlForKey(image?.url || ""),
     sanitizeDateSegment(image?.date || ""),
@@ -1459,6 +1606,16 @@ function buildImageKey(image) {
   ].filter(Boolean).join("|") || "image";
 
   return `img-${shortHashText(keyInput, 12)}`;
+}
+
+function sanitizeProvidedImageKey(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+
+  const safe = sanitizePathSegment(text, "image").slice(0, 80);
+  return safe.startsWith("img-") ? safe : `img-${safe}`;
 }
 
 function imageKeyToShortHash(imageKey) {

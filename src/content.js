@@ -98,6 +98,7 @@ async function scanChatGptImages(options = {}) {
   const cards = new Map();
   const originals = new Map();
   const parseFailures = [];
+  const skippedItems = [];
   const deduplicatedItemSamples = [];
   const collectionStats = createCollectionStats();
   let detailFailureCount = 0;
@@ -150,14 +151,19 @@ async function scanChatGptImages(options = {}) {
     }
   }
 
-  const cardList = Array.from(cards.values()).filter((card) => document.contains(card.element));
+  const cardList = buildSortedCardList(cards);
+  const scanList = buildStableScanList(cardList);
+  const directOriginals = collectDirectOriginalCandidates(cards, scanList);
+  const directResourceSummary = mergeDirectOriginalsIntoScanList(scanList, directOriginals);
   reportLog(jobId, "info", "缩略图收集完成", {
     collected: cardList.length,
+    scanListItems: scanList.length,
     checked: collectionStats.checked,
     skippedSmall: collectionStats.skippedSmall,
     skippedNoCandidate: collectionStats.skippedNoCandidate,
     skippedUiAsset: collectionStats.skippedUiAsset,
-    skippedSamples: collectionStats.skippedSamples
+    skippedSamples: collectionStats.skippedSamples,
+    directResources: directResourceSummary
   }, "scan");
 
   if (!cardList.length && collectionStats.skippedUiAsset) {
@@ -168,43 +174,101 @@ async function scanChatGptImages(options = {}) {
     }, "scan");
   }
 
+  reportLog(jobId, "info", "stable scanList created", {
+    total: scanList.length,
+    cardItems: cardList.length,
+    directResourcesFound: directResourceSummary.found,
+    directResourcesMerged: directResourceSummary.merged,
+    directResourcesAppended: directResourceSummary.appended,
+    items: createScanListReport(scanList).slice(0, 40)
+  }, "scan");
+
   reportProgress(jobId, {
     stage: "resolving",
-    message: `缩略图收集完成，共 ${cardList.length} 张，开始解析原图...`,
-    scanned: cardList.length,
-    total: cardList.length
+    message: `Stable scanList ready: ${scanList.length} items. Resolving originals...`,
+    scanned: scanList.length,
+    total: scanList.length
   });
 
-  for (const [index, card] of cardList.entries()) {
+  for (const [index, scanItem] of scanList.entries()) {
     ensureJobActive(jobId);
-    const original = await resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index + 1);
+    const card = scanItem.card || null;
+    const scanIndex = scanItem.scanIndex;
+    let original = null;
 
-    if (original) {
-      resolvedCardItems += 1;
-      if (originals.has(canonicalUrl(original.url))) {
-        deduplicatedItems += 1;
-        if (deduplicatedItemSamples.length < 20) {
-          deduplicatedItemSamples.push(createDeduplicatedItem(card, original, index + 1));
+    if (scanItem.source === "direct-resource") {
+      original = scanItem.directOriginal || null;
+    } else if (card) {
+      original = await resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, scanIndex);
+
+      if (!original && scanItem.directOriginals.length) {
+        original = selectBestDirectOriginal(scanItem.directOriginals);
+        if (original) {
+          scanItem.resolutionSource = "direct-merged-fallback";
+          reportLog(jobId, "info", "merged direct resource used as fallback", {
+            scanIndex,
+            pageOrder: scanItem.pageOrder,
+            imageKey: scanItem.imageKey,
+            directSource: original.source || "",
+            url: summarizeUrl(original.url)
+          }, "resolve");
         }
       }
-      addCandidate(originals, original);
+    }
+
+    if (original) {
+      if (scanItem.source !== "direct-resource") {
+        resolvedCardItems += 1;
+      }
+
+      const image = materializeScanImage(original, scanItem);
+      const addResult = addCandidate(originals, image);
+      if (addResult.status === "duplicate") {
+        deduplicatedItems += 1;
+        scanItem.status = "skipped";
+        scanItem.reason = "duplicate-original-url";
+        if (deduplicatedItemSamples.length < 20) {
+          deduplicatedItemSamples.push(createDeduplicatedItem(card, image, scanIndex, scanItem));
+        }
+        skippedItems.push(createSkippedScanItem(scanItem, "duplicate-original-url", "dedupe", {
+          duplicateOfScanIndex: addResult.image?.scanIndex || null,
+          originalUrl: summarizeUrl(image.url)
+        }));
+      } else {
+        scanItem.status = "resolved";
+        scanItem.reason = "";
+        scanItem.resolvedUrl = summarizeUrl(image.url);
+      }
     } else {
       detailFailureCount += 1;
-      const failure = createParseFailureItem(card, index + 1, {
+      scanItem.status = "parse-failed";
+      scanItem.reason = scanItem.reason || "no-download-candidate";
+      const failure = createParseFailureItem(card || scanItem, scanIndex, {
+        scanIndex,
+        pageOrder: scanItem.pageOrder,
+        source: scanItem.source,
+        imageKey: scanItem.imageKey,
+        position: scanItem.position,
         reason: "no-download-candidate",
         stage: "resolve",
         diagnostic: {
-          total: cardList.length,
-          thumbnail: summarizeUrl(card.thumbnailUrl),
-          hasDerivedOriginalUrl: Boolean(card.derivedOriginalUrl)
+          total: scanList.length,
+          thumbnail: summarizeUrl(scanItem.thumbnailUrl),
+          hasDerivedOriginalUrl: Boolean(card?.derivedOriginalUrl),
+          directResourceCount: scanItem.directOriginals.length,
+          directResourceDisposition: scanItem.directResourceDisposition || ""
         }
       });
       parseFailures.push(failure);
-      reportLog(jobId, "warn", "原图解析失败：没有返回可下载候选", {
-        index: index + 1,
-        total: cardList.length,
-        thumbnail: summarizeUrl(card.thumbnailUrl),
-        hasDerivedOriginalUrl: Boolean(card.derivedOriginalUrl),
+      reportLog(jobId, "warn", "original resolve failed: no downloadable candidate", {
+        scanIndex,
+        pageOrder: scanItem.pageOrder,
+        source: scanItem.source,
+        total: scanList.length,
+        imageKey: scanItem.imageKey,
+        thumbnail: summarizeUrl(scanItem.thumbnailUrl),
+        hasDerivedOriginalUrl: Boolean(card?.derivedOriginalUrl),
+        directResourceCount: scanItem.directOriginals.length,
         reason: failure.reason,
         stage: failure.stage,
         diagnostic: failure.diagnostic
@@ -213,46 +277,43 @@ async function scanChatGptImages(options = {}) {
 
     reportProgress(jobId, {
       stage: "resolving",
-      message: `已扫描 ${cardList.length} 张，解析成功 ${resolvedCardItems} 张，唯一原图 ${originals.size} 张，失败 ${detailFailureCount} 张，已去重 ${deduplicatedItems} 张，正在处理第 ${index + 1}/${cardList.length} 张。`,
-      scanned: cardList.length,
+      message: `Resolving scanList ${index + 1}/${scanList.length}: resolved cards ${resolvedCardItems}, unique originals ${originals.size}, failed ${detailFailureCount}, deduped ${deduplicatedItems}.`,
+      scanned: scanList.length,
       matched: originals.size,
       detailFailureCount,
       resolvedCardItems,
       deduplicatedItems,
       current: index + 1,
-      total: cardList.length
+      total: scanList.length
     });
   }
 
-  const directOriginals = collectDirectOriginalCandidates(cards);
-  for (const directOriginal of directOriginals) {
-    addCandidate(originals, directOriginal);
-  }
-
-  if (directOriginals.length) {
-    reportLog(jobId, "info", "已从页面资源中直接发现可下载候选", {
-      count: directOriginals.length,
-      samples: directOriginals.slice(0, 5).map((image) => summarizeUrl(image.url))
-    });
-  }
-
-  const images = Array.from(originals.values());
-  const scannedCount = Math.max(cardList.length, images.length);
+  const images = Array.from(originals.values())
+    .sort((left, right) => numberOrDefault(left.scanIndex, 0) - numberOrDefault(right.scanIndex, 0));
+  const scannedCount = scanList.length;
+  const scanListReport = createScanListReport(scanList);
   activeScanJobs.delete(jobId);
   reportLog(jobId, images.length ? "info" : "warn", "内容脚本扫描结束", {
     scanned: scannedCount,
     visibleCards: cardList.length,
+    scanListItems: scanList.length,
     matched: images.length,
     resolvedCardItems,
     detailFailureCount,
     parseFailures: parseFailures.length,
-    deduplicatedItems
+    deduplicatedItems,
+    skippedItems: skippedItems.length,
+    directResources: directResourceSummary,
+    scanList: scanListReport.slice(0, 40)
   }, "scan");
 
   return {
     scanned: scannedCount,
     matched: images.length,
     images,
+    scanList: scanListReport,
+    skippedItems,
+    directResourceSummary,
     resolvedCardItems,
     detailFailureCount,
     parseFailures,
@@ -263,8 +324,8 @@ async function scanChatGptImages(options = {}) {
 }
 
 function collectImageCards(cards, stats = null) {
-  for (const img of document.images) {
-    const card = imageCardFromElement(img, stats);
+  for (const [domOrder, img] of Array.from(document.images).entries()) {
+    const card = imageCardFromElement(img, stats, domOrder);
     if (!card) {
       continue;
     }
@@ -272,6 +333,7 @@ function collectImageCards(cards, stats = null) {
     const key = canonicalUrl(card.thumbnailUrl);
     const existing = cards.get(key);
     if (!existing) {
+      card.collectionOrder = cards.size + 1;
       cards.set(key, card);
       continue;
     }
@@ -292,7 +354,375 @@ function collectImageCards(cards, stats = null) {
     if (!existing.date && card.date) {
       existing.date = card.date;
     }
+
+    existing.position = chooseEarlierPosition(existing.position, card.position);
   }
+}
+
+function buildSortedCardList(cards) {
+  const cardList = Array.from(cards.values());
+  for (const card of cardList) {
+    refreshCardPosition(card);
+  }
+
+  return cardList.sort(compareCardsByPageOrder);
+}
+
+function refreshCardPosition(card) {
+  const element = card?.imageElement || card?.element;
+  if (!element?.getBoundingClientRect || !document.contains(element)) {
+    return;
+  }
+
+  card.position = captureElementPosition(element, card.position?.domOrder ?? card.collectionOrder ?? 0);
+}
+
+function buildStableScanList(cardList) {
+  return cardList.map((card, index) => {
+    const scanIndex = index + 1;
+    const pageOrder = index + 1;
+    const imageKey = buildParseFailureImageKey(card, scanIndex);
+    const scanItem = {
+      scanIndex,
+      pageOrder,
+      imageKey,
+      thumbnailUrl: card.thumbnailUrl || "",
+      prompt: card.prompt || card.alt || "",
+      date: card.date || "",
+      position: normalizePosition(card.position),
+      source: "card",
+      card,
+      directOriginals: [],
+      directResourceDisposition: "",
+      directSources: [],
+      status: "pending",
+      reason: ""
+    };
+
+    Object.assign(card, {
+      scanIndex,
+      pageOrder,
+      imageKey,
+      source: "card",
+      position: scanItem.position
+    });
+
+    return scanItem;
+  });
+}
+
+function mergeDirectOriginalsIntoScanList(scanList, directOriginals) {
+  const summary = {
+    found: directOriginals.length,
+    merged: 0,
+    appended: 0,
+    samples: []
+  };
+
+  for (const directOriginal of directOriginals) {
+    const scanItem = findScanItemForDirectOriginal(directOriginal, scanList);
+    if (scanItem && scanItem.source !== "direct-resource") {
+      scanItem.directOriginals.push(directOriginal);
+      scanItem.directResourceDisposition = "merged";
+      if (directOriginal.source && !scanItem.directSources.includes(directOriginal.source)) {
+        scanItem.directSources.push(directOriginal.source);
+      }
+      summary.merged += 1;
+      addDirectResourceSummarySample(summary, directOriginal, scanItem, "merged");
+      continue;
+    }
+
+    const directItem = createDirectResourceScanItem(directOriginal, scanList.length + 1);
+    scanList.push(directItem);
+    summary.appended += 1;
+    addDirectResourceSummarySample(summary, directOriginal, directItem, "appended");
+  }
+
+  return summary;
+}
+
+function createDirectResourceScanItem(directOriginal, scanIndex) {
+  const pageOrder = scanIndex;
+  const imageKey = buildDirectResourceImageKey(directOriginal, scanIndex);
+  return {
+    scanIndex,
+    pageOrder,
+    imageKey,
+    thumbnailUrl: directOriginal.thumbnailUrl || "",
+    prompt: directOriginal.prompt || directOriginal.alt || "",
+    date: directOriginal.date || "",
+    position: normalizePosition(directOriginal.position),
+    source: "direct-resource",
+    directSource: directOriginal.source || "",
+    directOriginal: {
+      ...directOriginal,
+      scanIndex,
+      pageOrder,
+      imageKey,
+      source: "direct-resource",
+      directSource: directOriginal.source || ""
+    },
+    directOriginals: [],
+    directResourceDisposition: "appended",
+    directSources: [directOriginal.source || "direct-resource"].filter(Boolean),
+    status: "pending",
+    reason: ""
+  };
+}
+
+function findScanItemForDirectOriginal(directOriginal, scanList) {
+  if (!directOriginal) {
+    return null;
+  }
+
+  if (directOriginal.scanIndex) {
+    const byScanIndex = scanList.find((item) => item.scanIndex === directOriginal.scanIndex);
+    if (byScanIndex) {
+      return byScanIndex;
+    }
+  }
+
+  if (directOriginal.relatedImageKey || directOriginal.imageKey) {
+    const imageKey = directOriginal.relatedImageKey || directOriginal.imageKey;
+    const byImageKey = scanList.find((item) => item.imageKey === imageKey);
+    if (byImageKey) {
+      return byImageKey;
+    }
+  }
+
+  const directUrlKey = canonicalUrl(directOriginal.url || "");
+  const thumbnailKey = canonicalUrl(directOriginal.thumbnailUrl || "");
+  const byUrl = scanList.find((item) => {
+    const card = item.card || {};
+    return directUrlKey && (
+      directUrlKey === canonicalUrl(item.thumbnailUrl || "")
+      || directUrlKey === canonicalUrl(card.thumbnailUrl || "")
+      || (card.derivedOriginalUrl && directUrlKey === canonicalUrl(card.derivedOriginalUrl))
+    ) || thumbnailKey && thumbnailKey === canonicalUrl(item.thumbnailUrl || "");
+  });
+
+  if (byUrl) {
+    return byUrl;
+  }
+
+  const directPrompt = normalizeMatchText(directOriginal.prompt || directOriginal.alt || "");
+  const directDate = String(directOriginal.date || "");
+  if (directPrompt || directDate) {
+    const textMatches = scanList.filter((item) => {
+      const itemPrompt = normalizeMatchText(item.prompt || "");
+      const itemDate = String(item.date || "");
+      return (directPrompt && itemPrompt && directPrompt === itemPrompt)
+        || (directDate && itemDate && directDate === itemDate && directPrompt && itemPrompt.includes(directPrompt.slice(0, 32)));
+    });
+
+    if (textMatches.length === 1) {
+      return textMatches[0];
+    }
+  }
+
+  return findNearestScanItemByPosition(directOriginal.position, scanList);
+}
+
+function findNearestScanItemByPosition(position, scanList) {
+  const normalized = normalizePosition(position);
+  if (!Number.isFinite(normalized.top) || !Number.isFinite(normalized.left)) {
+    return null;
+  }
+
+  let best = null;
+  let bestDistance = Infinity;
+  for (const item of scanList) {
+    if (item.source === "direct-resource") {
+      continue;
+    }
+    const itemPosition = normalizePosition(item.position);
+    if (!Number.isFinite(itemPosition.top) || !Number.isFinite(itemPosition.left)) {
+      continue;
+    }
+    const distance = Math.abs(itemPosition.top - normalized.top) + Math.abs(itemPosition.left - normalized.left);
+    if (distance < bestDistance) {
+      best = item;
+      bestDistance = distance;
+    }
+  }
+
+  return bestDistance <= 80 ? best : null;
+}
+
+function selectBestDirectOriginal(directOriginals) {
+  return [...directOriginals].sort((a, b) => directOriginalScore(b) - directOriginalScore(a))[0] || null;
+}
+
+function directOriginalScore(original) {
+  return Number(original.directCandidateScore || original.score || 0)
+    + Math.round((original.width || 0) * (original.height || 0));
+}
+
+function materializeScanImage(original, scanItem) {
+  const source = scanItem.source === "direct-resource"
+    ? "direct-resource"
+    : (original.source || scanItem.source || "card");
+
+  return {
+    ...original,
+    scanIndex: scanItem.scanIndex,
+    pageOrder: scanItem.pageOrder,
+    imageKey: scanItem.imageKey,
+    thumbnailUrl: original.thumbnailUrl || scanItem.thumbnailUrl || "",
+    prompt: original.prompt || scanItem.prompt || "",
+    date: original.date || scanItem.date || "",
+    source,
+    directSource: original.directSource || (scanItem.source === "direct-resource" ? scanItem.directSource : original.source || ""),
+    resolutionSource: scanItem.resolutionSource || original.source || "",
+    position: normalizePosition(scanItem.position),
+    directResourceDisposition: scanItem.directResourceDisposition || ""
+  };
+}
+
+function createScanListReport(scanList) {
+  return scanList.map((item) => ({
+    scanIndex: item.scanIndex,
+    pageOrder: item.pageOrder,
+    imageKey: item.imageKey,
+    thumbnailUrl: summarizeUrl(item.thumbnailUrl),
+    prompt: truncateReportText(item.prompt || "", 240),
+    date: truncateReportText(item.date || "", 80),
+    position: normalizePosition(item.position),
+    source: item.source || "",
+    status: item.status || "pending",
+    reason: item.reason || "",
+    resolvedUrl: item.resolvedUrl || "",
+    directResourceDisposition: item.directResourceDisposition || "",
+    directSource: item.directSource || "",
+    directSources: item.directSources || [],
+    directResourceCount: item.source === "direct-resource" ? 1 : (item.directOriginals?.length || 0)
+  }));
+}
+
+function createSkippedScanItem(scanItem, reason, stage, diagnostic = {}) {
+  return {
+    index: scanItem.scanIndex,
+    scanIndex: scanItem.scanIndex,
+    pageOrder: scanItem.pageOrder,
+    imageKey: scanItem.imageKey,
+    thumbnailUrl: summarizeUrl(scanItem.thumbnailUrl),
+    prompt: truncateReportText(scanItem.prompt || "", 240),
+    date: truncateReportText(scanItem.date || "", 80),
+    source: scanItem.source || "",
+    reason,
+    stage,
+    diagnostic: sanitizeReportDiagnostic({
+      position: normalizePosition(scanItem.position),
+      directResourceDisposition: scanItem.directResourceDisposition || "",
+      directSources: scanItem.directSources || [],
+      ...diagnostic
+    }, 1000)
+  };
+}
+
+function addDirectResourceSummarySample(summary, directOriginal, scanItem, disposition) {
+  if (summary.samples.length >= 20) {
+    return;
+  }
+
+  summary.samples.push({
+    disposition,
+    scanIndex: scanItem.scanIndex,
+    pageOrder: scanItem.pageOrder,
+    imageKey: scanItem.imageKey,
+    source: scanItem.source,
+    directSource: directOriginal.source || "",
+    url: summarizeUrl(directOriginal.url)
+  });
+}
+
+function buildDirectResourceImageKey(directOriginal, index) {
+  const keyInput = [
+    canonicalUrl(directOriginal?.url || ""),
+    directOriginal?.date || "",
+    directOriginal?.prompt || "",
+    index
+  ].filter(Boolean).join("|") || `direct-${index}`;
+
+  return `img-${shortHashText(keyInput, 12)}`;
+}
+
+function compareCardsByPageOrder(left, right) {
+  return comparePosition(left.position, right.position)
+    || numberOrDefault(left.collectionOrder, 0) - numberOrDefault(right.collectionOrder, 0)
+    || canonicalUrl(left.thumbnailUrl || "").localeCompare(canonicalUrl(right.thumbnailUrl || ""));
+}
+
+function chooseEarlierPosition(left, right) {
+  if (!left) {
+    return normalizePosition(right);
+  }
+  if (!right) {
+    return normalizePosition(left);
+  }
+
+  return comparePosition(left, right) <= 0 ? normalizePosition(left) : normalizePosition(right);
+}
+
+function comparePosition(left, right) {
+  const a = normalizePosition(left);
+  const b = normalizePosition(right);
+  const topDelta = finiteOrMax(a.top) - finiteOrMax(b.top);
+  if (Math.abs(topDelta) > 8) {
+    return topDelta;
+  }
+
+  const leftDelta = finiteOrMax(a.left) - finiteOrMax(b.left);
+  if (Math.abs(leftDelta) > 8) {
+    return leftDelta;
+  }
+
+  return finiteOrMax(a.domOrder) - finiteOrMax(b.domOrder);
+}
+
+function captureElementPosition(element, domOrder = 0, rect = null) {
+  const box = rect || element?.getBoundingClientRect?.() || {};
+  return normalizePosition({
+    top: Math.round((box.top || 0) + window.scrollY),
+    left: Math.round((box.left || 0) + window.scrollX),
+    width: Math.round(box.width || 0),
+    height: Math.round(box.height || 0),
+    domOrder
+  });
+}
+
+function normalizePosition(position = {}) {
+  position = position && typeof position === "object" ? position : {};
+
+  return {
+    top: finiteNumber(position.top),
+    left: finiteNumber(position.left),
+    width: finiteNumber(position.width),
+    height: finiteNumber(position.height),
+    domOrder: finiteNumber(position.domOrder)
+  };
+}
+
+function finiteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function finiteOrMax(value) {
+  if (value === null || value === undefined || value === "") {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  const number = Number(value);
+  return Number.isFinite(number) ? number : Number.MAX_SAFE_INTEGER;
+}
+
+function normalizeMatchText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+    .slice(0, 120);
 }
 
 function createCollectionStats() {
@@ -324,7 +754,7 @@ function noteSkippedImage(stats, reason, url) {
   });
 }
 
-function imageCardFromElement(img, stats = null) {
+function imageCardFromElement(img, stats = null, domOrder = 0) {
   if (stats) {
     stats.checked += 1;
   }
@@ -377,6 +807,8 @@ function imageCardFromElement(img, stats = null) {
     alt: img.getAttribute("alt") || img.getAttribute("aria-label") || "",
     width: Math.round(width),
     height: Math.round(height),
+    position: captureElementPosition(img, domOrder, rect),
+    source: "card",
     resolved: false
   };
 }
@@ -465,7 +897,8 @@ async function resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index) 
     alt: card.alt || detailRoot.getAttribute?.("aria-label") || "",
     thumbnailUrl: card.thumbnailUrl || "",
     width: Math.round(best.width || card.width || 0),
-    height: Math.round(best.height || card.height || 0)
+    height: Math.round(best.height || card.height || 0),
+    source: best.source || "detail"
   };
 }
 
@@ -682,23 +1115,26 @@ function isUnverifiedEstuaryFallbackCandidate(candidate, reason) {
     && /detail-not-opened|detail-only-thumbnail|detail-no-candidate/.test(String(reason || ""));
 }
 
-function collectDirectOriginalCandidates(cards) {
+function collectDirectOriginalCandidates(cards, scanList = []) {
   const rawCandidates = [];
-  const cardList = Array.from(cards.values());
+  const cardList = scanList.length
+    ? scanList.map((item) => item.card).filter(Boolean)
+    : Array.from(cards.values());
 
-  for (const img of document.images) {
+  for (const [domOrder, img] of Array.from(document.images).entries()) {
     const relatedCard = cardList.find((card) => card.imageElement === img) || null;
     for (const candidate of imageUrlCandidatesFromElement(img, "direct-img")) {
       addDirectOriginalCandidate(rawCandidates, candidate.url, candidate.source, {
         card: relatedCard,
         width: candidate.width,
         height: candidate.height,
-        score: candidate.score
+        score: candidate.score,
+        position: relatedCard?.position || captureElementPosition(img, domOrder)
       });
     }
   }
 
-  for (const source of document.querySelectorAll("source[srcset]")) {
+  for (const [domOrder, source] of Array.from(document.querySelectorAll("source[srcset]")).entries()) {
     const rect = source.parentElement?.getBoundingClientRect?.();
     const candidates = srcSetCandidates(source.getAttribute("srcset"), {
       width: rect?.width || 0,
@@ -710,18 +1146,20 @@ function collectDirectOriginalCandidates(cards) {
       addDirectOriginalCandidate(rawCandidates, candidate.url, candidate.source, {
         width: candidate.width,
         height: candidate.height,
-        score: candidate.score
+        score: candidate.score,
+        position: source.parentElement ? captureElementPosition(source.parentElement, domOrder, rect) : null
       });
     }
   }
 
-  for (const link of document.querySelectorAll("a[href]")) {
+  for (const [domOrder, link] of Array.from(document.querySelectorAll("a[href]")).entries()) {
     addDirectOriginalCandidate(rawCandidates, link.href || link.getAttribute("href"), "direct-link", {
-      score: link.hasAttribute("download") ? 850000 : 350000
+      score: link.hasAttribute("download") ? 850000 : 350000,
+      position: captureElementPosition(link, domOrder)
     });
   }
 
-  for (const element of Array.from(document.querySelectorAll("[style]")).slice(0, 1200)) {
+  for (const [domOrder, element] of Array.from(document.querySelectorAll("[style]")).slice(0, 1200).entries()) {
     const style = element.getAttribute("style") || "";
     const rect = element.getBoundingClientRect();
 
@@ -729,7 +1167,8 @@ function collectDirectOriginalCandidates(cards) {
       addDirectOriginalCandidate(rawCandidates, match[1], "direct-style", {
         width: Math.round(rect.width || 0),
         height: Math.round(rect.height || 0),
-        score: Math.round((rect.width || 0) * (rect.height || 0))
+        score: Math.round((rect.width || 0) * (rect.height || 0)),
+        position: captureElementPosition(element, domOrder, rect)
       });
     }
   }
@@ -771,7 +1210,12 @@ function addDirectOriginalCandidate(candidates, rawUrl, source, options = {}) {
     height: options.height || 0,
     source,
     score: (options.score || 0) + (derived ? 900000 : 0),
-    card: options.card || null
+    order: candidates.length + 1,
+    card: options.card || null,
+    position: normalizePosition(options.position || options.card?.position),
+    thumbnailUrl: options.card?.thumbnailUrl || "",
+    prompt: options.card?.prompt || "",
+    date: options.card?.date || ""
   });
 }
 
@@ -787,18 +1231,46 @@ function directResultsFromCandidates(candidates, cards) {
   }
 
   return Array.from(unique.values())
-    .sort((a, b) => directCandidateScore(b) - directCandidateScore(a))
+    .sort(compareDirectCandidates)
     .map((candidate) => {
       const card = candidate.card || findRelatedCardForCandidate(candidate.url, cards) || {
         date: null,
         prompt: "",
         alt: "",
+        thumbnailUrl: candidate.thumbnailUrl || "",
+        position: candidate.position,
         width: candidate.width || 0,
         height: candidate.height || 0
       };
 
-      return imageResultFromCandidate(candidate, card);
+      const result = imageResultFromCandidate(candidate, card);
+      return {
+        ...result,
+        scanIndex: card.scanIndex || 0,
+        pageOrder: card.pageOrder || 0,
+        imageKey: card.imageKey || "",
+        relatedImageKey: card.imageKey || "",
+        position: normalizePosition(card.position || candidate.position),
+        directCandidateOrder: candidate.order || 0,
+        directCandidateScore: directCandidateScore(candidate)
+      };
     });
+}
+
+function compareDirectCandidates(left, right) {
+  const leftCardOrder = left.card?.pageOrder || Number.MAX_SAFE_INTEGER;
+  const rightCardOrder = right.card?.pageOrder || Number.MAX_SAFE_INTEGER;
+  if (leftCardOrder !== rightCardOrder) {
+    return leftCardOrder - rightCardOrder;
+  }
+
+  const positionCompare = comparePosition(left.position, right.position);
+  if (positionCompare) {
+    return positionCompare;
+  }
+
+  return numberOrDefault(left.order, 0) - numberOrDefault(right.order, 0)
+    || directCandidateScore(right) - directCandidateScore(left);
 }
 
 function directCandidateScore(candidate) {
@@ -928,7 +1400,10 @@ function imageResultFromCandidate(candidate, card) {
     alt: card.alt,
     thumbnailUrl: card.thumbnailUrl || "",
     width: Math.round(candidate.width || card.width || 0),
-    height: Math.round(candidate.height || card.height || 0)
+    height: Math.round(candidate.height || card.height || 0),
+    source: candidate.source || "",
+    directSource: candidate.source || "",
+    position: normalizePosition(candidate.position || card.position)
   };
 }
 
@@ -947,19 +1422,24 @@ function createParseFailureItem(card, index, fallback = {}) {
     ...(failure.diagnostic && typeof failure.diagnostic === "object" ? failure.diagnostic : {})
   };
   const reason = truncateReportText(failure.reason || fallback.reason || "unknown-parse-failure", 160);
+  const scanIndex = Number(fallback.scanIndex || card.scanIndex || index || 0);
 
   return {
-    index,
-    imageKey: failure.imageKey || buildParseFailureImageKey(card, index),
+    index: scanIndex || index,
+    scanIndex: scanIndex || index,
+    pageOrder: Number(fallback.pageOrder || card.pageOrder || scanIndex || index || 0),
+    imageKey: failure.imageKey || fallback.imageKey || buildParseFailureImageKey(card, index),
     thumbnailUrl: summarizeUrl(card.thumbnailUrl),
     prompt: truncateReportText(card.prompt || card.alt || "", 240),
     date: truncateReportText(card.date || "", 80),
+    source: truncateReportText(fallback.source || card.source || "", 80),
     reason,
     stage: truncateReportText(failure.stage || fallback.stage || "resolve", 80),
     diagnostic: sanitizeReportDiagnostic({
       cardWidth: card.width || 0,
       cardHeight: card.height || 0,
       hasDerivedOriginalUrl: Boolean(card.derivedOriginalUrl),
+      position: normalizePosition(fallback.position || card.position),
       ...diagnostic
     }),
     quality: normalizePreparedQuality(failure.quality || fallback.quality || diagnostic.quality, {
@@ -973,19 +1453,23 @@ function createParseFailureItem(card, index, fallback = {}) {
   };
 }
 
-function createDeduplicatedItem(card, original, index) {
+function createDeduplicatedItem(card, original, index, scanItem = null) {
   return {
     index,
-    imageKey: buildResolvedImageKey(original, card, index),
-    thumbnailUrl: summarizeUrl(card.thumbnailUrl),
-    prompt: truncateReportText(card.prompt || original.prompt || card.alt || "", 240),
-    date: truncateReportText(card.date || original.date || "", 80),
+    scanIndex: scanItem?.scanIndex || original.scanIndex || index,
+    pageOrder: scanItem?.pageOrder || original.pageOrder || index,
+    imageKey: scanItem?.imageKey || original.imageKey || buildResolvedImageKey(original, card, index),
+    thumbnailUrl: summarizeUrl(scanItem?.thumbnailUrl || card?.thumbnailUrl || original.thumbnailUrl),
+    prompt: truncateReportText(scanItem?.prompt || card?.prompt || original.prompt || card?.alt || "", 240),
+    date: truncateReportText(scanItem?.date || card?.date || original.date || "", 80),
+    source: scanItem?.source || original.source || "",
     reason: "duplicate-original-url",
     stage: "dedupe",
     diagnostic: sanitizeReportDiagnostic({
       originalUrl: summarizeUrl(original.url),
-      cardWidth: card.width || 0,
-      cardHeight: card.height || 0
+      cardWidth: card?.width || 0,
+      cardHeight: card?.height || 0,
+      position: normalizePosition(scanItem?.position || card?.position)
     }, 1000)
   };
 }
@@ -3861,12 +4345,16 @@ function cleanPrompt(value) {
 }
 
 function addCandidate(seen, candidate) {
+  if (!candidate?.url) {
+    return { status: "invalid", image: null };
+  }
+
   const key = canonicalUrl(candidate.url);
   const existing = seen.get(key);
 
   if (!existing) {
     seen.set(key, candidate);
-    return;
+    return { status: "added", image: candidate };
   }
 
   if (!existing.date && candidate.date) {
@@ -3885,6 +4373,28 @@ function addCandidate(seen, candidate) {
     existing.width = candidate.width;
     existing.height = candidate.height;
   }
+
+  if (!existing.scanIndex && candidate.scanIndex) {
+    existing.scanIndex = candidate.scanIndex;
+  }
+
+  if (!existing.pageOrder && candidate.pageOrder) {
+    existing.pageOrder = candidate.pageOrder;
+  }
+
+  if (!existing.imageKey && candidate.imageKey) {
+    existing.imageKey = candidate.imageKey;
+  }
+
+  if (!existing.source && candidate.source) {
+    existing.source = candidate.source;
+  }
+
+  if (!existing.position && candidate.position) {
+    existing.position = candidate.position;
+  }
+
+  return { status: "duplicate", image: existing };
 }
 
 function canonicalUrl(url) {
