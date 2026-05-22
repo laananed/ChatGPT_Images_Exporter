@@ -2,15 +2,18 @@ const form = document.querySelector("#download-form");
 const startButton = document.querySelector("#start");
 const statusEl = document.querySelector("#status");
 const logListEl = document.querySelector("#log-list");
+const copyFailuresButton = document.querySelector("#copy-failures");
 const copyLogsButton = document.querySelector("#copy-logs");
 const clearLogsButton = document.querySelector("#clear-logs");
 const POLL_INTERVAL_MS = 1000;
 
 let pollTimer = null;
 let latestLogs = [];
+let latestJobReport = null;
 
 restoreSettings();
 refreshJobStatus();
+refreshJobReport();
 refreshJobLogs();
 startPolling();
 
@@ -33,6 +36,7 @@ form.addEventListener("submit", async (event) => {
       payload: {
         tabId: tab.id,
         folder: settings.folder,
+        accountLabel: settings.accountLabel,
         maxScrolls: settings.maxScrolls,
         delayMs: settings.delayMs
       }
@@ -64,6 +68,28 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
   if (changes.imageJobLogs?.newValue) {
     renderLogs(changes.imageJobLogs.newValue);
+  }
+
+  const reportChange = changes.jobReport || changes.imageJobReport || changes.jobManifest;
+  if (reportChange?.newValue) {
+    latestJobReport = reportChange.newValue;
+  }
+});
+
+copyFailuresButton.addEventListener("click", async () => {
+  try {
+    const report = latestJobReport || await readLatestJobReport();
+    const text = formatFailureReportForCopy(report);
+    if (!text) {
+      setStatus("当前没有失败清单可复制。");
+      flashButtonText(copyFailuresButton, "无失败");
+      return;
+    }
+
+    await navigator.clipboard.writeText(text);
+    flashButtonText(copyFailuresButton, "已复制");
+  } catch (error) {
+    setStatus(`复制失败清单失败：${error?.message || String(error)}`, "error");
   }
 });
 
@@ -101,6 +127,7 @@ async function restoreSettings() {
   }
 
   document.querySelector("#folder").value = settings.folder || "ChatGPT Images";
+  document.querySelector("#account-label").value = settings.accountLabel || "";
   document.querySelector("#max-scrolls").value = settings.maxScrolls ?? 30;
   document.querySelector("#delay-ms").value = settings.delayMs ?? 400;
 }
@@ -108,6 +135,7 @@ async function restoreSettings() {
 function readSettings() {
   return {
     folder: document.querySelector("#folder").value.trim() || "ChatGPT Images",
+    accountLabel: document.querySelector("#account-label").value.trim(),
     maxScrolls: numberInputValue("#max-scrolls", 30),
     delayMs: numberInputValue("#delay-ms", 0)
   };
@@ -132,6 +160,19 @@ async function refreshJobStatus() {
   } catch {
     // The popup can still start a new task even if the first status read fails.
   }
+}
+
+async function refreshJobReport() {
+  try {
+    latestJobReport = await readLatestJobReport();
+  } catch {
+    latestJobReport = null;
+  }
+}
+
+async function readLatestJobReport() {
+  const result = await chrome.storage.local.get(["jobReport", "jobManifest", "imageJobReport"]);
+  return result.jobReport || result.imageJobReport || result.jobManifest || null;
 }
 
 async function refreshJobLogs() {
@@ -211,6 +252,7 @@ function stopPolling() {
 
 function renderJobStatus(job = {}) {
   const active = job.status === "running" || job.status === "downloading";
+  const metrics = jobMetrics(job);
   setBusy(active);
 
   if (!job.status || job.status === "idle") {
@@ -220,22 +262,19 @@ function renderJobStatus(job = {}) {
 
   if (job.status === "running") {
     const detail = job.total
-      ? `\n已扫描 ${job.scanned || 0} 张，已解析原图 ${job.matched || 0} 张，失败 ${job.detailFailureCount || 0} 张，进度 ${job.current || 0}/${job.total}。`
-      : `\n已扫描 ${job.scanned || 0} 张，正在收集缩略图。`;
+      ? `\n${formatMetricsLine(metrics)}\n进度 ${job.current || 0}/${job.total}。`
+      : `\n${formatMetricsLine(metrics)}\n正在收集缩略图。`;
     setStatus(`${job.message || "任务运行中..."}${detail}`);
     return;
   }
 
   if (job.status === "downloading") {
-    setStatus(`${job.message || "正在启动下载..."}\n原图链接 ${job.matched || 0} 张，解析失败 ${job.detailFailureCount || 0} 张。`);
+    setStatus(`${job.message || "正在启动下载..."}\n${formatMetricsLine(metrics)}`);
     return;
   }
 
   if (job.status === "done") {
-    const failures = job.downloadFailures
-      ? `\n下载失败 ${job.downloadFailures} 个。`
-      : "";
-    setStatus(`${job.message || "任务完成。"}\n扫描 ${job.scanned || 0} 张，解析原图 ${job.matched || 0} 张，详情失败 ${job.detailFailureCount || 0} 张。${failures}`, "success");
+    setStatus(`${job.message || "任务完成。"}\n${formatMetricsLine(metrics)}`, "success");
     return;
   }
 
@@ -247,6 +286,50 @@ function renderJobStatus(job = {}) {
   if (job.status === "error") {
     setStatus(`${job.message || "任务失败。"}\n请刷新 ChatGPT 页面后重试。`, "error");
   }
+}
+
+function jobMetrics(job = {}) {
+  const report = latestJobReport && latestJobReport.jobId === (job.id || job.jobId)
+    ? latestJobReport
+    : null;
+
+  return {
+    scannedItems: numberMetric(job.scannedItems ?? job.scanned ?? report?.scannedItems),
+    resolvedCardItems: numberMetric(job.resolvedCardItems ?? report?.resolvedCardItems),
+    resolvedItems: numberMetric(job.resolvedItems ?? job.matched ?? report?.resolvedItems),
+    deduplicatedItems: numberMetric(job.deduplicatedItems ?? report?.deduplicatedItems),
+    parseFailures: numberMetric(job.parseFailureCount ?? job.detailFailureCount ?? report?.parseFailures),
+    qualityFailures: numberMetric(job.qualityFailureCount ?? job.qualityFailures ?? report?.qualityFailures),
+    submittedDownloads: numberMetric(job.submittedDownloads ?? job.downloadStarted ?? report?.submittedDownloads),
+    downloadFailures: numberMetric(job.downloadFailureCount ?? job.downloadFailures ?? report?.downloadFailures)
+  };
+}
+
+function numberMetric(value) {
+  if (Array.isArray(value)) {
+    return value.length;
+  }
+
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function formatMetricsLine(metrics) {
+  const resolvedCardItems = metrics.resolvedCardItems
+    || Math.max(metrics.scannedItems - metrics.parseFailures, metrics.resolvedItems);
+  const deduplicatedItems = metrics.deduplicatedItems
+    || Math.max(resolvedCardItems - metrics.resolvedItems, 0);
+
+  return [
+    `质量失败 ${metrics.qualityFailures} 张`,
+    `扫描 ${metrics.scannedItems} 张`,
+    `解析成功 ${resolvedCardItems} 张`,
+    `解析失败 ${metrics.parseFailures} 张`,
+    `唯一原图 ${metrics.resolvedItems} 张`,
+    `已去重 ${deduplicatedItems} 张`,
+    `提交下载 ${metrics.submittedDownloads} 张`,
+    `下载提交失败 ${metrics.downloadFailures} 张`
+  ].join("，") + "。";
 }
 
 function renderLogs(logs = []) {
@@ -283,6 +366,36 @@ function formatLogsForCopy(logs) {
     const detail = log.detail ? `\n  detail: ${JSON.stringify(log.detail)}` : "";
     return `${time} ${String(log.level || "info").toUpperCase()} ${log.source || ""}/${log.stage || ""} ${log.message || ""}${detail}`;
   }).join("\n");
+}
+
+function formatFailureReportForCopy(report) {
+  if (!report || typeof report !== "object") {
+    return "";
+  }
+
+  const parseFailures = Array.isArray(report.parseFailures) ? report.parseFailures : [];
+  const qualityFailures = Array.isArray(report.qualityFailures) ? report.qualityFailures : [];
+  const downloadFailures = Array.isArray(report.downloadFailures) ? report.downloadFailures : [];
+
+  if (!parseFailures.length && !qualityFailures.length && !downloadFailures.length) {
+    return "";
+  }
+
+  return JSON.stringify({
+    jobId: report.jobId || "",
+    runFolder: report.runFolder || "",
+    startedAt: report.startedAt || null,
+    endedAt: report.endedAt || null,
+    scannedItems: numberMetric(report.scannedItems),
+    resolvedCardItems: numberMetric(report.resolvedCardItems),
+    resolvedItems: numberMetric(report.resolvedItems),
+    deduplicatedItems: numberMetric(report.deduplicatedItems),
+    deduplicatedItemSamples: Array.isArray(report.deduplicatedItemSamples) ? report.deduplicatedItemSamples : [],
+    submittedDownloads: numberMetric(report.submittedDownloads),
+    parseFailures,
+    qualityFailures,
+    downloadFailures
+  }, null, 2);
 }
 
 function flashButtonText(button, text) {

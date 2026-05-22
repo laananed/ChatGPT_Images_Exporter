@@ -19,6 +19,11 @@
           <input id="folder" type="text" value="ChatGPT Images" maxlength="80">
         </label>
 
+        <label>
+          <span>账号/标签（可选）</span>
+          <input id="account-label" type="text" maxlength="80" placeholder="default">
+        </label>
+
         <div class="grid">
           <label>
             <span>滚动次数</span>
@@ -40,6 +45,7 @@
         <div class="log-header">
           <h2>诊断日志</h2>
           <div class="log-actions">
+            <button id="copy-failures" class="secondary" type="button">复制失败清单</button>
             <button id="copy-logs" class="secondary" type="button">复制</button>
             <button id="clear-logs" class="secondary" type="button">清空</button>
           </div>

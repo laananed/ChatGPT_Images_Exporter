@@ -97,8 +97,12 @@ async function scanChatGptImages(options = {}) {
   const detailOpenTimeoutMs = clamp(numberOrDefault(options.detailOpenTimeoutMs, DEFAULT_DETAIL_OPEN_TIMEOUT_MS), 800, 8000);
   const cards = new Map();
   const originals = new Map();
+  const parseFailures = [];
+  const deduplicatedItemSamples = [];
   const collectionStats = createCollectionStats();
   let detailFailureCount = 0;
+  let resolvedCardItems = 0;
+  let deduplicatedItems = 0;
   let unchangedScrolls = 0;
 
   activeScanJobs.add(jobId);
@@ -176,23 +180,45 @@ async function scanChatGptImages(options = {}) {
     const original = await resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index + 1);
 
     if (original) {
+      resolvedCardItems += 1;
+      if (originals.has(canonicalUrl(original.url))) {
+        deduplicatedItems += 1;
+        if (deduplicatedItemSamples.length < 20) {
+          deduplicatedItemSamples.push(createDeduplicatedItem(card, original, index + 1));
+        }
+      }
       addCandidate(originals, original);
     } else {
       detailFailureCount += 1;
+      const failure = createParseFailureItem(card, index + 1, {
+        reason: "no-download-candidate",
+        stage: "resolve",
+        diagnostic: {
+          total: cardList.length,
+          thumbnail: summarizeUrl(card.thumbnailUrl),
+          hasDerivedOriginalUrl: Boolean(card.derivedOriginalUrl)
+        }
+      });
+      parseFailures.push(failure);
       reportLog(jobId, "warn", "原图解析失败：没有返回可下载候选", {
         index: index + 1,
         total: cardList.length,
         thumbnail: summarizeUrl(card.thumbnailUrl),
-        hasDerivedOriginalUrl: Boolean(card.derivedOriginalUrl)
+        hasDerivedOriginalUrl: Boolean(card.derivedOriginalUrl),
+        reason: failure.reason,
+        stage: failure.stage,
+        diagnostic: failure.diagnostic
       });
     }
 
     reportProgress(jobId, {
       stage: "resolving",
-      message: `已扫描 ${cardList.length} 张，已解析原图 ${originals.size} 张，失败 ${detailFailureCount} 张，正在处理第 ${index + 1}/${cardList.length} 张。`,
+      message: `已扫描 ${cardList.length} 张，解析成功 ${resolvedCardItems} 张，唯一原图 ${originals.size} 张，失败 ${detailFailureCount} 张，已去重 ${deduplicatedItems} 张，正在处理第 ${index + 1}/${cardList.length} 张。`,
       scanned: cardList.length,
       matched: originals.size,
       detailFailureCount,
+      resolvedCardItems,
+      deduplicatedItems,
       current: index + 1,
       total: cardList.length
     });
@@ -217,14 +243,21 @@ async function scanChatGptImages(options = {}) {
     scanned: scannedCount,
     visibleCards: cardList.length,
     matched: images.length,
-    detailFailureCount
+    resolvedCardItems,
+    detailFailureCount,
+    parseFailures: parseFailures.length,
+    deduplicatedItems
   }, "scan");
 
   return {
     scanned: scannedCount,
     matched: images.length,
     images,
+    resolvedCardItems,
     detailFailureCount,
+    parseFailures,
+    deduplicatedItems,
+    deduplicatedItemSamples,
     unknownDateCount: images.filter((image) => !image.date).length
   };
 }
@@ -375,7 +408,11 @@ async function resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index) 
       openAttempts: openResult.attempts
     });
     await closeDetail(beforeHref);
-    return fallbackOriginalFromCard(card, jobId, index, "detail-not-opened");
+    return fallbackOriginalFromCard(card, jobId, index, "detail-not-opened", {
+      timeoutMs: detailOpenTimeoutMs,
+      openAttempts: openResult.attempts,
+      clickableTag: card.element?.tagName || ""
+    });
   }
 
   await sleep(DETAIL_SETTLE_MS);
@@ -391,7 +428,9 @@ async function resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index) 
       candidateCount: candidates.length,
       thumbnail: summarizeUrl(card.thumbnailUrl)
     });
-    return fallbackOriginalFromCard(card, jobId, index, "detail-no-candidate");
+    return fallbackOriginalFromCard(card, jobId, index, "detail-no-candidate", {
+      candidateCount: candidates.length
+    });
   }
 
   if (isSameSmallThumbnail(best, card)) {
@@ -403,7 +442,12 @@ async function resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index) 
       bestWidth: best.width || 0,
       bestHeight: best.height || 0
     });
-    return fallbackOriginalFromCard(card, jobId, index, "detail-only-thumbnail");
+    return fallbackOriginalFromCard(card, jobId, index, "detail-only-thumbnail", {
+      candidateCount: candidates.length,
+      best: summarizeUrl(best.url),
+      bestWidth: best.width || 0,
+      bestHeight: best.height || 0
+    });
   }
 
   reportLog(jobId, "info", "详情解析成功", {
@@ -419,6 +463,7 @@ async function resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index) 
     date: card.date || findDate(detailRoot, detailRoot),
     prompt: card.prompt || findPrompt(detailRoot, detailRoot),
     alt: card.alt || detailRoot.getAttribute?.("aria-label") || "",
+    thumbnailUrl: card.thumbnailUrl || "",
     width: Math.round(best.width || card.width || 0),
     height: Math.round(best.height || card.height || 0)
   };
@@ -452,6 +497,13 @@ async function originalFromDerivedThumbnail(card, jobId, index) {
       original: summarizeUrl(candidate.url),
       check
     });
+    card.derivedOriginalFailure = {
+      reason: "derived-original-precheck-403",
+      diagnostic: {
+        original: summarizeUrl(candidate.url),
+        check
+      }
+    };
     return null;
     /*
     reportLog(jobId, "warn", "预检 403，保留候选继续下载", {
@@ -468,13 +520,25 @@ async function originalFromDerivedThumbnail(card, jobId, index) {
     original: summarizeUrl(candidate.url),
     check
   });
+  card.derivedOriginalFailure = {
+    reason: "derived-original-precheck-failed",
+    diagnostic: {
+      original: summarizeUrl(candidate.url),
+      check
+    }
+  };
 
   return null;
 }
 
-function fallbackOriginalFromCard(card, jobId, index, reason) {
+function fallbackOriginalFromCard(card, jobId, index, reason, diagnostic = {}) {
   const candidates = collectFallbackImageUrlCandidates(card);
   const best = chooseBestCandidate(candidates, card.thumbnailUrl);
+  const baseDiagnostic = {
+    detailReason: reason,
+    ...diagnostic,
+    derivedOriginalFailure: card.derivedOriginalFailure || null
+  };
 
   if (!best) {
     reportLog(jobId, "warn", "Fallback 解析失败：确实没有可用 URL", {
@@ -482,6 +546,15 @@ function fallbackOriginalFromCard(card, jobId, index, reason) {
       reason,
       candidateCount: candidates.length,
       thumbnail: summarizeUrl(card.thumbnailUrl)
+    });
+    noteCardParseFailure(card, {
+      reason: "fallback-no-candidate",
+      stage: "resolve-fallback",
+      diagnostic: {
+        ...baseDiagnostic,
+        candidateCount: candidates.length,
+        thumbnail: summarizeUrl(card.thumbnailUrl)
+      }
     });
     return null;
   }
@@ -493,6 +566,18 @@ function fallbackOriginalFromCard(card, jobId, index, reason) {
       candidateCount: candidates.length,
       thumbnail: summarizeUrl(card.thumbnailUrl),
       best: summarizeUrl(best.url)
+    });
+    noteCardParseFailure(card, {
+      reason: "fallback-only-thumbnail",
+      stage: "resolve-fallback",
+      diagnostic: {
+        ...baseDiagnostic,
+        candidateCount: candidates.length,
+        thumbnail: summarizeUrl(card.thumbnailUrl),
+        best: summarizeUrl(best.url),
+        bestWidth: best.width || 0,
+        bestHeight: best.height || 0
+      }
     });
     return null;
   }
@@ -512,6 +597,17 @@ function fallbackOriginalFromCard(card, jobId, index, reason) {
       candidateCount: candidates.length,
       selected: summarizeUrl(best.url),
       source: best.source || ""
+    });
+    noteCardParseFailure(card, {
+      reason: "unverified-estuary-fallback",
+      stage: "resolve-fallback",
+      diagnostic: {
+        ...baseDiagnostic,
+        candidateCount: candidates.length,
+        thumbnail: summarizeUrl(card.thumbnailUrl),
+        selected: summarizeUrl(best.url),
+        source: best.source || ""
+      }
     });
     return null;
   }
@@ -830,9 +926,117 @@ function imageResultFromCandidate(candidate, card) {
     date: card.date,
     prompt: card.prompt,
     alt: card.alt,
+    thumbnailUrl: card.thumbnailUrl || "",
     width: Math.round(candidate.width || card.width || 0),
     height: Math.round(candidate.height || card.height || 0)
   };
+}
+
+function noteCardParseFailure(card, failure) {
+  if (!card || card.resolveFailure) {
+    return;
+  }
+
+  card.resolveFailure = failure;
+}
+
+function createParseFailureItem(card, index, fallback = {}) {
+  const failure = card.resolveFailure || fallback || {};
+  const diagnostic = {
+    ...(fallback.diagnostic && typeof fallback.diagnostic === "object" ? fallback.diagnostic : {}),
+    ...(failure.diagnostic && typeof failure.diagnostic === "object" ? failure.diagnostic : {})
+  };
+  const reason = truncateReportText(failure.reason || fallback.reason || "unknown-parse-failure", 160);
+
+  return {
+    index,
+    imageKey: failure.imageKey || buildParseFailureImageKey(card, index),
+    thumbnailUrl: summarizeUrl(card.thumbnailUrl),
+    prompt: truncateReportText(card.prompt || card.alt || "", 240),
+    date: truncateReportText(card.date || "", 80),
+    reason,
+    stage: truncateReportText(failure.stage || fallback.stage || "resolve", 80),
+    diagnostic: sanitizeReportDiagnostic({
+      cardWidth: card.width || 0,
+      cardHeight: card.height || 0,
+      hasDerivedOriginalUrl: Boolean(card.derivedOriginalUrl),
+      ...diagnostic
+    }),
+    quality: normalizePreparedQuality(failure.quality || fallback.quality || diagnostic.quality, {
+      width: 0,
+      height: 0,
+      size: 0,
+      mimeType: "",
+      isOriginalLikely: false,
+      rejectReason: reason
+    })
+  };
+}
+
+function createDeduplicatedItem(card, original, index) {
+  return {
+    index,
+    imageKey: buildResolvedImageKey(original, card, index),
+    thumbnailUrl: summarizeUrl(card.thumbnailUrl),
+    prompt: truncateReportText(card.prompt || original.prompt || card.alt || "", 240),
+    date: truncateReportText(card.date || original.date || "", 80),
+    reason: "duplicate-original-url",
+    stage: "dedupe",
+    diagnostic: sanitizeReportDiagnostic({
+      originalUrl: summarizeUrl(original.url),
+      cardWidth: card.width || 0,
+      cardHeight: card.height || 0
+    }, 1000)
+  };
+}
+
+function buildParseFailureImageKey(card, index) {
+  const keyInput = [
+    canonicalUrl(card?.thumbnailUrl || ""),
+    card?.date || "",
+    card?.prompt || "",
+    card?.alt || "",
+    index
+  ].filter(Boolean).join("|") || `card-${index}`;
+
+  return `img-${shortHashText(keyInput, 12)}`;
+}
+
+function buildResolvedImageKey(original, card, index) {
+  const keyInput = [
+    canonicalUrl(original?.url || ""),
+    canonicalUrl(card?.thumbnailUrl || ""),
+    original?.date || card?.date || "",
+    original?.prompt || card?.prompt || "",
+    index
+  ].filter(Boolean).join("|") || `image-${index}`;
+
+  return `img-${shortHashText(keyInput, 12)}`;
+}
+
+function sanitizeReportDiagnostic(value, maxLength = 2000) {
+  if (!value || typeof value !== "object") {
+    return value ? truncateReportText(value, maxLength) : null;
+  }
+
+  try {
+    const json = JSON.stringify(value);
+    if (json.length <= maxLength) {
+      return JSON.parse(json);
+    }
+
+    return {
+      truncated: true,
+      value: json.slice(0, maxLength)
+    };
+  } catch {
+    return { value: truncateReportText(String(value), maxLength) };
+  }
+}
+
+function truncateReportText(value, maxLength) {
+  const text = String(value ?? "");
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
 async function prepareImageDownload(payload = {}) {
@@ -905,8 +1109,8 @@ async function prepareImageDownload(payload = {}) {
   }, "download-prepare");
 
   let detailFallbackResult = null;
-  if (fetchResult.status === 403) {
-    reportLog(jobId, "warn", "fetch original URL returned 403; continuing to search page resources for a full-size image", {
+  if (shouldTryDetailFallbackForPreparedImage(fetchResult, detailBase)) {
+    reportLog(jobId, "warn", "direct candidate did not pass original-quality gate; opening detail view for recovery", {
       ...detailBase,
       fetchFailure: summarizePreparationAttempt(fetchResult)
     }, "download-prepare");
@@ -946,6 +1150,7 @@ async function prepareImageDownload(payload = {}) {
     reason: fallbackResult.reason || fetchResult.reason || "image-prepare-failed",
     status: fetchResult.status || 0,
     contentType: fetchResult.contentType || "",
+    quality: fallbackResult.qualityFailure || detailFallbackResult?.qualityFailure || fetchResult.qualityFailure || null,
     fetchFailure: summarizePreparationAttempt(fetchResult),
     detailFallbackFailure: detailFallbackResult ? summarizePreparationAttempt(detailFallbackResult) : null,
     fallbackFailure: summarizePreparationAttempt(fallbackResult),
@@ -1059,7 +1264,7 @@ async function prepareImageFromDetailFallback({ jobId, image, url, detailBase, f
   const beforeHref = location.href;
   const beforeUrls = currentImageUrlSet();
 
-  reportLog(jobId, "info", "open-detail-view: direct fetch returned 403, opening image detail", {
+  reportLog(jobId, "info", "open-detail-view: opening image detail to recover original", {
     ...detailBase,
     thumbnail: summarizeUrl(card.thumbnailUrl),
     cardWidth: card.width || 0,
@@ -1295,9 +1500,25 @@ async function prepareImageFromDetailCandidates({ jobId, candidates, detailBase,
     ok: false,
     reason: qualityFailureReason || (failures.length ? "detail-fallback-failed" : "detail-no-original"),
     candidateCount: candidates.length,
+    qualityFailure: firstQualityFailureDetail(failures),
     failures: failures.slice(0, 8),
     locationsTried: Array.from(new Set(locationsTried))
   };
+}
+
+function firstQualityFailureDetail(failures = []) {
+  for (const failure of failures) {
+    const quality = failure?.quality || failure?.diagnostic?.quality || failure?.diagnostic;
+    if (quality && typeof quality === "object" && (
+      Object.prototype.hasOwnProperty.call(quality, "isOriginalLikely")
+      || Object.prototype.hasOwnProperty.call(quality, "rejectReason")
+      || Object.prototype.hasOwnProperty.call(quality, "width")
+    )) {
+      return quality;
+    }
+  }
+
+  return null;
 }
 
 async function prepareImageFromPageFallback({ jobId, image, url, detailBase, fetchFailure }) {
@@ -1416,6 +1637,7 @@ async function prepareImageFromPageFallback({ jobId, image, url, detailBase, fet
     ok: false,
     reason: qualityFailureReason || (failures.length ? "page-fallback-failed" : "no-page-fallback-candidate"),
     candidateCount: candidates.length,
+    qualityFailure: firstQualityFailureDetail(failures),
     failures: failures.slice(0, 6),
     locationsTried: Array.from(new Set(locationsTried))
   };
@@ -1509,13 +1731,22 @@ async function finalizePreparedImageBlob(jobId, blob, context = {}) {
 }
 
 function failPreparedImage(jobId, reason, detail) {
+  const quality = normalizePreparedQuality(detail?.quality || detail?.validation, {
+    width: detail?.width || 0,
+    height: detail?.height || 0,
+    size: detail?.size || 0,
+    mimeType: detail?.mimeType || detail?.contentType || "",
+    isOriginalLikely: false,
+    rejectReason: reason || "prepare-failed"
+  });
   const result = {
     ok: false,
     reason,
     status: detail?.status || 0,
     contentType: detail?.contentType || "",
     urlSummary: detail?.url || null,
-    diagnostic: detail?.validation || detail || null
+    diagnostic: detail?.validation || detail || null,
+    quality
   };
 
   if (reason === "thumbnail-only" || reason === "low-resolution") {
@@ -1526,6 +1757,18 @@ function failPreparedImage(jobId, reason, detail) {
 
   reportLog(jobId, "warn", "下载前取图失败，未提交下载任务", detail, "download-prepare");
   return result;
+}
+
+function normalizePreparedQuality(value = {}, fallback = {}) {
+  return {
+    ...(value && typeof value === "object" ? value : {}),
+    width: Number(value?.width ?? fallback.width ?? 0) || 0,
+    height: Number(value?.height ?? fallback.height ?? 0) || 0,
+    size: Number(value?.size ?? fallback.size ?? 0) || 0,
+    mimeType: String(value?.mimeType || fallback.mimeType || ""),
+    isOriginalLikely: value?.isOriginalLikely === true,
+    rejectReason: String(value?.rejectReason || fallback.rejectReason || "not-checked")
+  };
 }
 
 async function readImageBlobDimensions(blob) {
@@ -1582,15 +1825,19 @@ async function readImageBlobDimensions(blob) {
 function validateOriginalImageQuality(blob, context = {}, dimensions = {}) {
   const width = Math.max(dimensions.width || 0, context.width || 0, context.naturalWidth || 0);
   const height = Math.max(dimensions.height || 0, context.height || 0, context.naturalHeight || 0);
+  const size = Number(blob?.size || 0);
+  const mimeType = normalizeMimeType(context.mimeType || blob?.type || context.contentType || "");
   const sourceUrl = context.sourceUrl || "";
   const fetchMethod = context.fetchMethod || context.method || "";
   const fallbackSource = context.fallbackSource || "";
   const sourceHasThumbnailMarker = hasThumbnailMarkerInUrl(sourceUrl);
   const sourceLooksLikeThumbnail = sourceUrlLooksLikeThumbnail(sourceUrl);
   const isCanvasFallback = /canvas/i.test(fetchMethod);
+  const missingDimensions = !width || !height;
   const is512Thumbnail = Boolean(width && height && width <= THUMBNAIL_MAX_DIMENSION && height <= THUMBNAIL_MAX_DIMENSION);
+  const dimensionTooSmall = Boolean(width && height && (width < MIN_ORIGINAL_DIMENSION || height < MIN_ORIGINAL_DIMENSION));
   const lowResolutionArea = Boolean(width && height && width * height < MIN_ORIGINAL_DIMENSION * MIN_ORIGINAL_DIMENSION);
-  const smallBlob = Boolean(blob?.size && blob.size < MIN_ORIGINAL_BLOB_SIZE_BYTES);
+  const smallBlob = Boolean(size < MIN_ORIGINAL_BLOB_SIZE_BYTES);
   const detail = {
     sourceUrl: sourceUrl ? summarizeUrl(sourceUrl) : null,
     sourceHasThumbnailMarker,
@@ -1599,38 +1846,57 @@ function validateOriginalImageQuality(blob, context = {}, dimensions = {}) {
     height,
     naturalWidth: width,
     naturalHeight: height,
-    size: blob?.size || 0,
+    size,
+    mimeType,
     minExpectedDimension: MIN_ORIGINAL_DIMENSION,
     minExpectedBlobSize: MIN_ORIGINAL_BLOB_SIZE_BYTES,
     fetchMethod,
     fallbackSource,
     isCanvasFallback,
+    missingDimensions,
+    is512Thumbnail,
+    dimensionTooSmall,
+    lowResolutionArea,
+    smallBlob,
+    isOriginalLikely: false,
+    rejectReason: "",
     dimensionDecodeError: dimensions.error || ""
   };
 
   if (sourceHasThumbnailMarker || sourceLooksLikeThumbnail || is512Thumbnail) {
+    const rejectReason = sourceHasThumbnailMarker || sourceLooksLikeThumbnail
+      ? "source-url-looks-like-thumbnail"
+      : "natural-size-at-or-below-512";
+
     return {
       ok: false,
       reason: "thumbnail-only",
       detail: {
         ...detail,
         rejected: true,
-        rejection: sourceHasThumbnailMarker || sourceLooksLikeThumbnail
-          ? "source-url-looks-like-thumbnail"
-          : "natural-size-at-or-below-512"
+        isOriginalLikely: false,
+        rejectReason,
+        rejection: rejectReason
       }
     };
   }
 
-  if ((isCanvasFallback && (lowResolutionArea || smallBlob))
-    || (lowResolutionArea && smallBlob)) {
+  if (missingDimensions || dimensionTooSmall || lowResolutionArea || smallBlob) {
+    const rejectReason = missingDimensions
+      ? "dimension-unavailable"
+      : dimensionTooSmall || lowResolutionArea
+        ? "dimensions-too-small"
+        : "blob-size-too-small";
+
     return {
       ok: false,
       reason: "low-resolution",
       detail: {
         ...detail,
         rejected: true,
-        rejection: "fallback-dimensions-or-blob-size-too-small"
+        isOriginalLikely: false,
+        rejectReason,
+        rejection: rejectReason
       }
     };
   }
@@ -1640,7 +1906,9 @@ function validateOriginalImageQuality(blob, context = {}, dimensions = {}) {
     reason: "",
     detail: {
       ...detail,
-      rejected: false
+      rejected: false,
+      isOriginalLikely: true,
+      rejectReason: ""
     }
   };
 }
@@ -1734,6 +2002,25 @@ function summarizePreparationAttempt(attempt = {}) {
   };
 }
 
+function shouldTryDetailFallbackForPreparedImage(attempt = {}, detailBase = {}) {
+  const reason = String(attempt.reason || "").toLowerCase();
+  const quality = attempt.qualityFailure?.quality || attempt.qualityFailure || null;
+  const rejectReason = String(quality?.rejectReason || quality?.rejection || "").toLowerCase();
+
+  return attempt.status === 403
+    || detailBase.normalizedFromThumbnail
+    || Boolean(detailBase.urlIntegrity?.hasThumbnailMarker)
+    || Boolean(detailBase.url?.looksLikeThumbnail || detailBase.requestedUrl?.looksLikeThumbnail)
+    || ["thumbnail-only", "low-resolution", "missing-quality-result"].includes(reason)
+    || Boolean(quality?.isOriginalLikely === false && (
+      rejectReason.includes("thumbnail")
+      || rejectReason.includes("dimension")
+      || rejectReason.includes("blob")
+      || rejectReason.includes("small")
+      || rejectReason.includes("quality")
+    ));
+}
+
 function findCardForDownloadImage(image = {}, targetUrl = "") {
   const targetUrls = [
     targetUrl,
@@ -1822,7 +2109,7 @@ function collectDetailDownloadFallbackCandidates(detailRoot, targetUrl, image = 
       + (source === "detail-link" ? 450000 : 0)
       + (source === "detail-download-link" ? 900000 : 0)
       + (normalizedFromThumbnail ? 150000 : 0)
-      - (rawLooksLikeThumbnail ? 900000 : 0);
+      - (rawLooksLikeThumbnail && !normalizedFromThumbnail ? 900000 : 0);
     const next = {
       url: originalUrl,
       rawUrl: absoluteUrl,
@@ -1960,15 +2247,23 @@ function describeThumbnailCandidateRejection(candidate = {}) {
   const url = candidate.url || "";
   const width = candidate.element?.naturalWidth || candidate.width || 0;
   const height = candidate.element?.naturalHeight || candidate.height || 0;
-  const hasMarker = hasThumbnailMarkerInUrl(rawUrl) || hasThumbnailMarkerInUrl(url);
-  const looksLikeThumbnail = candidate.rawLooksLikeThumbnail
-    || sourceUrlLooksLikeThumbnail(rawUrl)
-    || sourceUrlLooksLikeThumbnail(url);
+  const normalizedFromThumbnail = Boolean(candidate.normalizedFromThumbnail && canonicalUrl(rawUrl) !== canonicalUrl(url));
+  const hasMarker = hasThumbnailMarkerInUrl(url)
+    || (!normalizedFromThumbnail && hasThumbnailMarkerInUrl(rawUrl));
+  const looksLikeThumbnail = sourceUrlLooksLikeThumbnail(url)
+    || (!normalizedFromThumbnail && (
+      candidate.rawLooksLikeThumbnail
+      || sourceUrlLooksLikeThumbnail(rawUrl)
+    ));
   const is512Thumbnail = Boolean(width && height && width <= THUMBNAIL_MAX_DIMENSION && height <= THUMBNAIL_MAX_DIMENSION);
 
-  if (!hasMarker && !looksLikeThumbnail && !is512Thumbnail) {
+  if (!hasMarker && !looksLikeThumbnail && (!is512Thumbnail || normalizedFromThumbnail)) {
     return null;
   }
+
+  const rejection = hasMarker || looksLikeThumbnail
+    ? "source-url-looks-like-thumbnail"
+    : "natural-size-at-or-below-512";
 
   return {
     source: candidate.source || "",
@@ -1979,9 +2274,15 @@ function describeThumbnailCandidateRejection(candidate = {}) {
     looksLikeThumbnail,
     naturalWidth: width,
     naturalHeight: height,
-    rejection: hasMarker || looksLikeThumbnail
-      ? "source-url-looks-like-thumbnail"
-      : "natural-size-at-or-below-512"
+    rejection,
+    quality: normalizePreparedQuality(null, {
+      width,
+      height,
+      size: 0,
+      mimeType: "",
+      isOriginalLikely: false,
+      rejectReason: rejection
+    })
   };
 }
 
@@ -2814,9 +3115,13 @@ function chooseBestCandidate(candidates, thumbnailUrl) {
     }
 
     const normalizedFromThumbnail = canonicalUrl(originalUrl) !== canonicalUrl(absoluteUrl);
+    const rawLooksLikeThumbnail = hasThumbnailMarkerInUrl(absoluteUrl) || sourceUrlLooksLikeThumbnail(absoluteUrl);
+    const urlLooksLikeThumbnail = hasThumbnailMarkerInUrl(originalUrl) || sourceUrlLooksLikeThumbnail(originalUrl);
     const urlSize = sizeHintFromUrl(originalUrl);
     const width = Math.max(candidate.width || 0, urlSize.width || 0);
     const height = Math.max(candidate.height || 0, urlSize.height || 0);
+    const is512Thumbnail = Boolean(width && height && width <= THUMBNAIL_MAX_DIMENSION && height <= THUMBNAIL_MAX_DIMENSION);
+    const dimensionTooSmall = Boolean(width && height && (width < MIN_ORIGINAL_DIMENSION || height < MIN_ORIGINAL_DIMENSION));
     const key = canonicalUrl(originalUrl);
     const scored = {
       ...candidate,
@@ -2829,9 +3134,17 @@ function chooseBestCandidate(candidates, thumbnailUrl) {
         width,
         height,
         isThumbnail: key === thumbnailKey && !normalizedFromThumbnail,
-        normalizedFromThumbnail
+        normalizedFromThumbnail,
+        rawLooksLikeThumbnail,
+        urlLooksLikeThumbnail,
+        is512Thumbnail,
+        dimensionTooSmall
       }),
-      normalizedFromThumbnail
+      normalizedFromThumbnail,
+      rawLooksLikeThumbnail,
+      urlLooksLikeThumbnail,
+      is512Thumbnail,
+      dimensionTooSmall
     };
     const existing = unique.get(key);
 
@@ -2858,7 +3171,18 @@ function scoreCandidate(url, candidate) {
   if (candidate.normalizedFromThumbnail) score += 450000;
   if (lower.includes("chatgpt.com")) score += 150000;
   if (candidate.isThumbnail && !retainableDownloadUrl) score -= 750000;
-  if (/thumbnail|thumb|preview|small|avatar|icon/.test(lower) && !retainableDownloadUrl) score -= 600000;
+  if ((candidate.urlLooksLikeThumbnail || /thumbnail|thumb|preview|small|avatar|icon/.test(lower)) && !retainableDownloadUrl) {
+    score -= 900000;
+  }
+  if (candidate.rawLooksLikeThumbnail && !candidate.normalizedFromThumbnail) {
+    score -= 900000;
+  }
+  if (candidate.is512Thumbnail && !candidate.normalizedFromThumbnail) {
+    score -= 800000;
+  }
+  if (candidate.dimensionTooSmall && !candidate.normalizedFromThumbnail) {
+    score -= 250000;
+  }
   if (IMAGE_URL_RE.test(url)) score += 100000;
 
   return score;
@@ -2901,6 +3225,13 @@ function removeThumbnailMarkerFromUrl(url) {
       const originalId = id.replace(/#thumbnail$/i, "");
       if (originalId) {
         parsed.searchParams.set("id", originalId);
+        changed = true;
+      }
+    }
+
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (/^(?:thumbnail|thumb|preview|small)$/i.test(key)) {
+        parsed.searchParams.delete(key);
         changed = true;
       }
     }
@@ -3546,6 +3877,10 @@ function addCandidate(seen, candidate) {
     existing.prompt = candidate.prompt;
   }
 
+  if (!existing.thumbnailUrl && candidate.thumbnailUrl) {
+    existing.thumbnailUrl = candidate.thumbnailUrl;
+  }
+
   if ((candidate.width * candidate.height) > (existing.width * existing.height)) {
     existing.width = candidate.width;
     existing.height = candidate.height;
@@ -3560,6 +3895,29 @@ function canonicalUrl(url) {
   } catch {
     return url;
   }
+}
+
+function shortHashText(value, length = 8) {
+  const text = String(value || "");
+  const first = fnv1a(text, 0x811c9dc5);
+  const second = fnv1a(`${text.length}:${text}`, 0x01000193);
+
+  return `${toPaddedHex(first)}${toPaddedHex(second)}`.slice(0, length);
+}
+
+function fnv1a(text, seed) {
+  let hash = seed >>> 0;
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+
+  return hash >>> 0;
+}
+
+function toPaddedHex(value) {
+  return (value >>> 0).toString(16).padStart(8, "0");
 }
 
 function clamp(value, min, max) {
