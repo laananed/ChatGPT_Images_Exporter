@@ -5,6 +5,7 @@ const JOB_STATUS_KEY = "imageJobStatus";
 const JOB_LOGS_KEY = "imageJobLogs";
 const JOB_REPORT_KEY = "jobReport";
 const JOB_MANIFEST_KEY = "jobManifest";
+const DOWNLOAD_HISTORY_KEY = "downloadHistory";
 const MAX_LOG_ENTRIES = 300;
 const IMAGE_URL_RE = /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#].*)?$/i;
 const ESTUARY_CONTENT_PATHS = new Set([
@@ -118,6 +119,7 @@ async function startImageJob(payload = {}) {
   const settings = {
     folder: sanitizePathSegment(payload.folder || DEFAULT_FOLDER, DEFAULT_FOLDER),
     accountLabel: normalizeAccountLabel(payload.accountLabel),
+    downloadMode: normalizeDownloadMode(payload.downloadMode),
     maxScrolls: clamp(numberOrDefault(payload.maxScrolls, 30), 0, 250),
     delayMs: clamp(numberOrDefault(payload.delayMs, 400), 0, 5000),
     startedAt
@@ -157,6 +159,8 @@ async function startImageJob(payload = {}) {
     qualityFailureCount: 0,
     downloadFailures: 0,
     downloadFailureCount: 0,
+    skippedDuplicates: 0,
+    skippedDuplicateCount: 0,
     startedAt,
     endedAt: null,
     settings
@@ -179,7 +183,8 @@ async function startImageJob(payload = {}) {
     scanList: [],
     skippedItems: [],
     directResourceSummary: null,
-    downloadFailures: []
+    downloadFailures: [],
+    skippedDuplicates: []
   }));
   await appendJobLog({
     jobId,
@@ -193,6 +198,7 @@ async function startImageJob(payload = {}) {
       delayMs: settings.delayMs,
       folder: settings.folder,
       accountLabel: settings.accountLabel,
+      downloadMode: settings.downloadMode,
       runId: settings.runId,
       runFolder: settings.runFolder
     }
@@ -212,6 +218,7 @@ async function runImageJob(jobId, tabId, settings) {
   let parseFailures = [];
   let qualityFailures = [];
   let downloadFailures = [];
+  let skippedDuplicates = [];
   let scanList = [];
   let skippedItems = [];
   let directResourceSummary = null;
@@ -283,7 +290,8 @@ async function runImageJob(jobId, tabId, settings) {
       scanList,
       skippedItems,
       directResourceSummary,
-      downloadFailures
+      downloadFailures,
+      skippedDuplicates
     }));
     await mergeJobStatus(jobId, {
       status: "downloading",
@@ -312,11 +320,13 @@ async function runImageJob(jobId, tabId, settings) {
       accountLabel: settings.accountLabel,
       startedAt: settings.startedAt,
       runId: settings.runId,
-      delayMs: settings.delayMs
+      delayMs: settings.delayMs,
+      downloadMode: settings.downloadMode
     });
     submittedDownloads = Number(downloadResult.started || 0);
     qualityFailures = normalizeFailureItems(downloadResult.qualityFailures, "quality");
     downloadFailures = normalizeFailureItems(downloadResult.failures, "download");
+    skippedDuplicates = normalizeSkippedDuplicateItems(downloadResult.skippedDuplicates);
     await appendJobLog({
       jobId,
       level: qualityFailures.length || downloadFailures.length ? "warn" : "info",
@@ -327,6 +337,7 @@ async function runImageJob(jobId, tabId, settings) {
         started: submittedDownloads,
         qualityFailures: qualityFailures.length,
         failures: downloadFailures.length,
+        skippedDuplicates: skippedDuplicates.length,
         runId: downloadResult.runId,
         runFolder: downloadResult.runFolder
       }
@@ -349,7 +360,8 @@ async function runImageJob(jobId, tabId, settings) {
       scanList,
       skippedItems,
       directResourceSummary,
-      downloadFailures
+      downloadFailures,
+      skippedDuplicates
     });
     await saveJobReport(report);
     await appendJobLog({
@@ -369,6 +381,8 @@ async function runImageJob(jobId, tabId, settings) {
       submittedDownloads,
       downloadFailures: downloadFailures.length,
       downloadFailureCount: downloadFailures.length,
+      skippedDuplicates: skippedDuplicates.length,
+      skippedDuplicateCount: skippedDuplicates.length,
       scannedItems,
       resolvedCardItems,
       resolvedItems,
@@ -402,6 +416,7 @@ async function runImageJob(jobId, tabId, settings) {
       skippedItems,
       directResourceSummary,
       downloadFailures,
+      skippedDuplicates,
       diagnostic: {
         reason: error?.message || String(error),
         stage: "error"
@@ -433,6 +448,8 @@ async function runImageJob(jobId, tabId, settings) {
       qualityFailureCount: qualityFailures.length,
       downloadFailureCount: downloadFailures.length,
       downloadFailures: downloadFailures.length,
+      skippedDuplicates: skippedDuplicates.length,
+      skippedDuplicateCount: skippedDuplicates.length,
       endedAt
     });
   } finally {
@@ -538,7 +555,8 @@ async function cancelImageJob() {
     scanList: [],
     skippedItems: [],
     directResourceSummary: null,
-    downloadFailures: []
+    downloadFailures: [],
+    skippedDuplicates: []
   }));
   await appendJobLog({
     jobId: current.id,
@@ -574,7 +592,9 @@ async function getJobStatus() {
     qualityFailures: 0,
     qualityFailureCount: 0,
     downloadFailures: 0,
-    downloadFailureCount: 0
+    downloadFailureCount: 0,
+    skippedDuplicates: 0,
+    skippedDuplicateCount: 0
   };
 }
 
@@ -619,11 +639,14 @@ function createJobReport({
   parseFailures = [],
   qualityFailures = [],
   downloadFailures = [],
+  skippedDuplicates = [],
   scanList = [],
   skippedItems = [],
   directResourceSummary = null,
   diagnostic = null
 } = {}) {
+  const normalizedSkippedDuplicates = normalizeSkippedDuplicateItems(skippedDuplicates);
+
   return {
     jobId: String(jobId || ""),
     runFolder: String(runFolder || ""),
@@ -638,6 +661,8 @@ function createJobReport({
     parseFailures: normalizeFailureItems(parseFailures, "resolve"),
     qualityFailures: normalizeFailureItems(qualityFailures, "quality"),
     downloadFailures: normalizeFailureItems(downloadFailures, "download"),
+    skippedDuplicates: normalizedSkippedDuplicates,
+    skippedDuplicateCount: normalizedSkippedDuplicates.length,
     scanList: normalizeScanListItems(scanList),
     skippedItems: normalizeFailureItems(skippedItems, "skip"),
     directResourceSummary: sanitizeReportDiagnostic(directResourceSummary, 3000),
@@ -654,6 +679,7 @@ function summarizeJobReport(report = {}) {
     resolvedItems: report.resolvedItems || 0,
     deduplicatedItems: report.deduplicatedItems || 0,
     submittedDownloads: report.submittedDownloads || 0,
+    skippedDuplicates: Array.isArray(report.skippedDuplicates) ? report.skippedDuplicates.length : 0,
     parseFailures: Array.isArray(report.parseFailures) ? report.parseFailures.length : 0,
     qualityFailures: Array.isArray(report.qualityFailures) ? report.qualityFailures.length : 0,
     downloadFailures: Array.isArray(report.downloadFailures) ? report.downloadFailures.length : 0,
@@ -711,6 +737,41 @@ function normalizeFailureItems(items, fallbackStage = "") {
   return items
     .map((item, index) => normalizeFailureItem(item, fallbackStage, index + 1))
     .filter(Boolean);
+}
+
+function normalizeSkippedDuplicateItems(items) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item, index) => normalizeSkippedDuplicateItem(item, index + 1))
+    .filter(Boolean);
+}
+
+function normalizeSkippedDuplicateItem(item, fallbackIndex) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const index = Number(item.index || item.scanIndex || fallbackIndex || 0);
+  const scanIndex = Number(item.scanIndex || index || fallbackIndex || 0);
+  const pageOrder = Number(item.pageOrder || scanIndex || index || fallbackIndex || 0);
+
+  return {
+    index,
+    scanIndex,
+    pageOrder,
+    imageKey: truncateText(item.imageKey || buildReportImageKey(item, index), 80),
+    prompt: truncateText(item.prompt || item.alt || "", 240),
+    date: truncateText(item.date || "", 80),
+    sourceUrl: truncateText(item.sourceUrl || item.url || "", 1000),
+    previousFilename: truncateText(item.previousFilename || "", 1000),
+    previousDownloadId: item.previousDownloadId ?? null,
+    previousSubmittedAt: normalizeTimestamp(item.previousSubmittedAt) || null,
+    reason: truncateText(item.reason || "skippedDuplicate", 80),
+    stage: truncateText(item.stage || "history-dedupe", 80)
+  };
 }
 
 function normalizeFailureItem(item, fallbackStage = "", fallbackIndex = 0) {
@@ -965,10 +1026,14 @@ async function downloadImages(payload) {
   const { runId, runFolder } = runContext;
   const delayMs = clamp(Number(payload?.delayMs) || 400, 0, 5000);
   const tabId = Number(payload?.tabId || 0);
+  const downloadMode = normalizeDownloadMode(payload?.downloadMode);
+  const shouldSkipHistory = downloadMode !== "all";
+  const downloadHistory = await readDownloadHistory();
 
   let started = 0;
   const failures = [];
   const qualityFailures = [];
+  const skippedDuplicates = [];
 
   await appendJobLog({
     jobId,
@@ -981,7 +1046,9 @@ async function downloadImages(payload) {
       accountLabel,
       runId,
       runFolder,
-      total: images.length
+      total: images.length,
+      downloadMode,
+      historyItems: Object.keys(downloadHistory).length
     }
   });
 
@@ -996,6 +1063,41 @@ async function downloadImages(payload) {
     const imageKey = buildImageKey(image);
     const shortHash = imageKeyToShortHash(imageKey);
     const urlSummary = summarizeDownloadUrl(image.url);
+    const previousHistoryEntry = downloadHistory[imageKey] || null;
+    if (shouldSkipHistory && previousHistoryEntry) {
+      const skippedDuplicate = createSkippedDuplicateItem({
+        index: itemNumber,
+        scanIndex,
+        pageOrder,
+        image,
+        imageKey,
+        previous: previousHistoryEntry
+      });
+      skippedDuplicates.push(skippedDuplicate);
+      await appendJobLog({
+        jobId,
+        level: "info",
+        source: "background",
+        stage: "history-dedupe",
+        message: "skippedDuplicate: image already exists in downloadHistory",
+        detail: {
+          index: itemNumber,
+          scanIndex,
+          pageOrder,
+          total: images.length,
+          imageKey,
+          shortHash,
+          source: image.source || "",
+          runFolder,
+          previousFilename: previousHistoryEntry.filename || "",
+          previousDownloadId: previousHistoryEntry.downloadId ?? null,
+          sourceUrl: image.sourceUrl || image.url || ""
+        }
+      });
+
+      continue;
+    }
+
     await appendJobLog({
       jobId,
       level: "info",
@@ -1157,6 +1259,16 @@ async function downloadImages(payload) {
       }
 
       started += 1;
+      const historyEntry = createDownloadHistoryEntry({
+        image,
+        imageKey,
+        filename,
+        downloadId: submitted.downloadId,
+        sourceUrl: target.sourceUrl || image.sourceUrl || image.url || "",
+        submittedAt: Date.now()
+      });
+      downloadHistory[imageKey] = historyEntry;
+      await saveDownloadHistory(downloadHistory);
       await appendJobLog({
         jobId,
         level: "info",
@@ -1261,10 +1373,89 @@ async function downloadImages(payload) {
     submittedDownloads: started,
     qualityFailures,
     downloadFailures: failures,
+    skippedDuplicates,
     runId,
     runFolder,
     accountLabel
   };
+}
+
+async function readDownloadHistory() {
+  const result = await chrome.storage.local.get(DOWNLOAD_HISTORY_KEY);
+  return normalizeDownloadHistory(result[DOWNLOAD_HISTORY_KEY]);
+}
+
+async function saveDownloadHistory(history) {
+  await chrome.storage.local.set({
+    [DOWNLOAD_HISTORY_KEY]: normalizeDownloadHistory(history)
+  });
+}
+
+function normalizeDownloadHistory(value) {
+  const entries = Array.isArray(value)
+    ? value
+    : Object.values(value && typeof value === "object" ? value : {});
+  const history = {};
+
+  for (const item of entries) {
+    const normalized = normalizeDownloadHistoryEntry(item);
+    if (normalized) {
+      history[normalized.imageKey] = normalized;
+    }
+  }
+
+  return history;
+}
+
+function normalizeDownloadHistoryEntry(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const imageKey = sanitizeProvidedImageKey(item.imageKey);
+  if (!imageKey) {
+    return null;
+  }
+
+  return {
+    imageKey,
+    filename: String(item.filename || ""),
+    downloadId: item.downloadId ?? null,
+    date: String(item.date || ""),
+    prompt: String(item.prompt || ""),
+    sourceUrl: String(item.sourceUrl || ""),
+    submittedAt: normalizeTimestamp(item.submittedAt) || Date.now(),
+    completedAt: item.completedAt ? normalizeTimestamp(item.completedAt) || null : null
+  };
+}
+
+function createDownloadHistoryEntry({ image = {}, imageKey = "", filename = "", downloadId = null, sourceUrl = "", submittedAt = Date.now() } = {}) {
+  return normalizeDownloadHistoryEntry({
+    imageKey,
+    filename,
+    downloadId,
+    date: image.date || "",
+    prompt: image.prompt || image.alt || "",
+    sourceUrl,
+    submittedAt
+  });
+}
+
+function createSkippedDuplicateItem({ index, scanIndex, pageOrder, image = {}, imageKey = "", previous = {} } = {}) {
+  return normalizeSkippedDuplicateItem({
+    index,
+    scanIndex,
+    pageOrder,
+    imageKey,
+    prompt: image.prompt || image.alt || "",
+    date: image.date || "",
+    sourceUrl: image.sourceUrl || image.url || "",
+    previousFilename: previous.filename || "",
+    previousDownloadId: previous.downloadId ?? null,
+    previousSubmittedAt: previous.submittedAt || null,
+    reason: "skippedDuplicate",
+    stage: "history-dedupe"
+  }, index);
 }
 
 async function resolveDownloadTarget({ tabId, jobId, image, index, total }) {
@@ -1593,19 +1784,85 @@ function buildRunId(timestamp, jobId) {
 }
 
 function buildImageKey(image) {
+  const stableId = stableImageIdFromImage(image);
+  if (stableId) {
+    return `img-${shortHashText(stableId, 16)}`;
+  }
+
+  const originalUrl = canonicalizeOriginalImageUrlForKey(
+    image?.url || image?.sourceUrl || image?.originalUrl || image?.downloadUrl || ""
+  );
+  if (originalUrl) {
+    return `img-${shortHashText(`url:${originalUrl}`, 16)}`;
+  }
+
   const providedKey = sanitizeProvidedImageKey(image?.imageKey);
   if (providedKey) {
     return providedKey;
   }
 
   const keyInput = [
-    canonicalizeImageUrlForKey(image?.url || ""),
+    normalizeKeyText(image?.prompt || image?.alt || ""),
     sanitizeDateSegment(image?.date || ""),
-    normalizeKeyText(image?.prompt || ""),
-    normalizeKeyText(image?.alt || "")
+    canonicalizeImageUrlForKey(image?.thumbnailUrl || "")
   ].filter(Boolean).join("|") || "image";
 
-  return `img-${shortHashText(keyInput, 12)}`;
+  return `img-${shortHashText(`fallback:${keyInput}`, 16)}`;
+}
+
+function stableImageIdFromImage(image = {}) {
+  const explicitIds = [
+    image.estuaryId,
+    image.fileId,
+    image.fileID,
+    image.file_id
+  ];
+  for (const value of explicitIds) {
+    const id = normalizeStableImageId(value);
+    if (id) {
+      return id;
+    }
+  }
+
+  const urls = [
+    image.url,
+    image.sourceUrl,
+    image.originalUrl,
+    image.downloadUrl,
+    image.thumbnailUrl
+  ];
+  for (const url of urls) {
+    const id = stableImageIdFromUrl(url);
+    if (id) {
+      return id;
+    }
+  }
+
+  return "";
+}
+
+function stableImageIdFromUrl(url) {
+  const estuaryId = normalizedEstuaryContentId(url);
+  if (estuaryId) {
+    return `estuary:${estuaryId}`;
+  }
+
+  const fileId = normalizedFileId(url);
+  return fileId ? `file:${fileId}` : "";
+}
+
+function normalizeStableImageId(value) {
+  const text = String(value || "").trim().replace(/#thumbnail$/i, "");
+  if (!text) {
+    return "";
+  }
+
+  const fileMatch = text.match(/\bfile[-_][A-Za-z0-9_-]{8,}\b/);
+  if (fileMatch) {
+    return `file:${fileMatch[0]}`;
+  }
+
+  return `estuary:${text}`;
 }
 
 function sanitizeProvidedImageKey(value) {
@@ -1620,6 +1877,19 @@ function sanitizeProvidedImageKey(value) {
 
 function imageKeyToShortHash(imageKey) {
   return sanitizePathSegment(String(imageKey || "").replace(/^img-/i, ""), "image").slice(0, 8);
+}
+
+function canonicalizeOriginalImageUrlForKey(url) {
+  if (!url) {
+    return "";
+  }
+
+  const withoutThumbnail = removeThumbnailMarkerFromUrl(url) || url;
+  if (sourceUrlLooksLikeThumbnail(withoutThumbnail) && !removeThumbnailMarkerFromUrl(withoutThumbnail)) {
+    return "";
+  }
+
+  return canonicalizeImageUrlForKey(withoutThumbnail);
 }
 
 function canonicalizeImageUrlForKey(url) {
@@ -1653,6 +1923,68 @@ function canonicalizeImageUrlForKey(url) {
   }
 }
 
+function removeThumbnailMarkerFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const id = parsed.searchParams.get("id") || "";
+    let changed = false;
+
+    if (/#thumbnail$/i.test(id)) {
+      const originalId = id.replace(/#thumbnail$/i, "");
+      if (originalId) {
+        parsed.searchParams.set("id", originalId);
+        changed = true;
+      }
+    }
+
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (/^(?:thumbnail|thumb|preview|small)$/i.test(key)) {
+        parsed.searchParams.delete(key);
+        changed = true;
+      }
+    }
+
+    if (/^#thumbnail$/i.test(parsed.hash || "")) {
+      parsed.hash = "";
+      changed = true;
+    }
+
+    return changed ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizedEstuaryContentId(url) {
+  const id = estuaryContentInfo(url)?.id || "";
+  return id.replace(/#thumbnail$/i, "");
+}
+
+function normalizedFileId(url) {
+  if (!url) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(url);
+    const paramNames = ["file_id", "fileId", "file", "id"];
+    for (const name of paramNames) {
+      const value = parsed.searchParams.get(name) || "";
+      const match = value.match(/\bfile[-_][A-Za-z0-9_-]{8,}\b/);
+      if (match) {
+        return match[0];
+      }
+    }
+
+    const decoded = decodeURIComponent(`${parsed.pathname} ${parsed.search}`);
+    const match = decoded.match(/\bfile[-_][A-Za-z0-9_-]{8,}\b/);
+    return match ? match[0] : "";
+  } catch {
+    const match = String(url).match(/\bfile[-_][A-Za-z0-9_-]{8,}\b/);
+    return match ? match[0] : "";
+  }
+}
+
 function normalizeKeyText(value) {
   return String(value || "")
     .trim()
@@ -1672,6 +2004,10 @@ function sanitizePromptForFileName(value) {
 
 function normalizeAccountLabel(value) {
   return sanitizePathSegment(value || DEFAULT_ACCOUNT_LABEL, DEFAULT_ACCOUNT_LABEL).slice(0, 80) || DEFAULT_ACCOUNT_LABEL;
+}
+
+function normalizeDownloadMode(value) {
+  return String(value || "").toLowerCase() === "all" ? "all" : "new";
 }
 
 function sanitizeDateSegment(value) {
@@ -1790,12 +2126,26 @@ function isLikelyRealImageDownloadUrl(url) {
 }
 
 function isEstuaryContentUrl(url) {
+  return Boolean(estuaryContentInfo(url)?.isEstuaryContent);
+}
+
+function estuaryContentInfo(url) {
   try {
     const parsed = new URL(url);
+    const hostname = parsed.hostname.toLowerCase();
     const pathname = parsed.pathname.toLowerCase().replace(/\/+$/, "");
-    return isChatGptHost(parsed.hostname) && ESTUARY_CONTENT_PATHS.has(pathname);
+    const id = parsed.searchParams.get("id") || "";
+    const hash = parsed.hash || "";
+
+    return {
+      parsed,
+      id,
+      isEstuaryContent: isChatGptHost(hostname) && ESTUARY_CONTENT_PATHS.has(pathname),
+      hasThumbnailMarker: /#thumbnail$/i.test(id) || /^#thumbnail$/i.test(hash),
+      hasSignature: hasSignatureLikeSearchParam(parsed.searchParams)
+    };
   } catch {
-    return false;
+    return null;
   }
 }
 

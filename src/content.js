@@ -11,6 +11,18 @@ const ESTUARY_CONTENT_PATHS = new Set([
   "/api/estuary/content",
   "/backend-api/estuary/content"
 ]);
+const VOLATILE_IMAGE_KEY_PARAMS = new Set([
+  "sig",
+  "signature",
+  "token",
+  "se",
+  "st",
+  "sp",
+  "sv",
+  "expires",
+  "expiry",
+  "exp"
+]);
 const URL_CANDIDATE_ATTRS = [
   "href",
   "src",
@@ -381,7 +393,7 @@ function buildStableScanList(cardList) {
   return cardList.map((card, index) => {
     const scanIndex = index + 1;
     const pageOrder = index + 1;
-    const imageKey = buildParseFailureImageKey(card, scanIndex);
+    const imageKey = buildFallbackImageKey(card, card, scanIndex);
     const scanItem = {
       scanIndex,
       pageOrder,
@@ -443,7 +455,7 @@ function mergeDirectOriginalsIntoScanList(scanList, directOriginals) {
 
 function createDirectResourceScanItem(directOriginal, scanIndex) {
   const pageOrder = scanIndex;
-  const imageKey = buildDirectResourceImageKey(directOriginal, scanIndex);
+  const imageKey = directOriginal.imageKey || buildDirectResourceImageKey(directOriginal, scanIndex);
   return {
     scanIndex,
     pageOrder,
@@ -562,6 +574,12 @@ function materializeScanImage(original, scanItem) {
   const source = scanItem.source === "direct-resource"
     ? "direct-resource"
     : (original.source || scanItem.source || "card");
+  const card = scanItem.card || scanItem;
+  const imageKey = buildResolvedImageKey(original, card, scanItem.scanIndex);
+  scanItem.imageKey = imageKey || scanItem.imageKey;
+  if (scanItem.card) {
+    scanItem.card.imageKey = scanItem.imageKey;
+  }
 
   return {
     ...original,
@@ -637,14 +655,7 @@ function addDirectResourceSummarySample(summary, directOriginal, scanItem, dispo
 }
 
 function buildDirectResourceImageKey(directOriginal, index) {
-  const keyInput = [
-    canonicalUrl(directOriginal?.url || ""),
-    directOriginal?.date || "",
-    directOriginal?.prompt || "",
-    index
-  ].filter(Boolean).join("|") || `direct-${index}`;
-
-  return `img-${shortHashText(keyInput, 12)}`;
+  return buildResolvedImageKey(directOriginal, directOriginal, index);
 }
 
 function compareCardsByPageOrder(left, right) {
@@ -1248,7 +1259,7 @@ function directResultsFromCandidates(candidates, cards) {
         ...result,
         scanIndex: card.scanIndex || 0,
         pageOrder: card.pageOrder || 0,
-        imageKey: card.imageKey || "",
+        imageKey: result.imageKey || card.imageKey || "",
         relatedImageKey: card.imageKey || "",
         position: normalizePosition(card.position || candidate.position),
         directCandidateOrder: candidate.order || 0,
@@ -1393,7 +1404,7 @@ function urlsFromText(text) {
 }
 
 function imageResultFromCandidate(candidate, card) {
-  return {
+  const result = {
     url: candidate.url,
     date: card.date,
     prompt: card.prompt,
@@ -1405,6 +1416,10 @@ function imageResultFromCandidate(candidate, card) {
     directSource: candidate.source || "",
     position: normalizePosition(candidate.position || card.position)
   };
+  result.imageKey = buildResolvedImageKey(result, card, card.scanIndex || candidate.order || 0);
+  result.normalizedOriginalUrl = normalizedOriginalUrlForKey(result.url);
+
+  return result;
 }
 
 function noteCardParseFailure(card, failure) {
@@ -1475,27 +1490,169 @@ function createDeduplicatedItem(card, original, index, scanItem = null) {
 }
 
 function buildParseFailureImageKey(card, index) {
-  const keyInput = [
-    canonicalUrl(card?.thumbnailUrl || ""),
-    card?.date || "",
-    card?.prompt || "",
-    card?.alt || "",
-    index
-  ].filter(Boolean).join("|") || `card-${index}`;
-
-  return `img-${shortHashText(keyInput, 12)}`;
+  return buildFallbackImageKey(card, card, index);
 }
 
 function buildResolvedImageKey(original, card, index) {
-  const keyInput = [
-    canonicalUrl(original?.url || ""),
-    canonicalUrl(card?.thumbnailUrl || ""),
-    original?.date || card?.date || "",
-    original?.prompt || card?.prompt || "",
-    index
-  ].filter(Boolean).join("|") || `image-${index}`;
+  const stableId = stableImageIdFromCandidate(original, card);
+  if (stableId) {
+    return `img-${shortHashText(stableId, 16)}`;
+  }
 
-  return `img-${shortHashText(keyInput, 12)}`;
+  const normalizedOriginalUrl = normalizedOriginalUrlForKey(
+    original?.url || original?.sourceUrl || original?.originalUrl || original?.downloadUrl || ""
+  );
+  if (normalizedOriginalUrl) {
+    return `img-${shortHashText(`url:${normalizedOriginalUrl}`, 16)}`;
+  }
+
+  return buildFallbackImageKey(original, card, index);
+}
+
+function buildFallbackImageKey(candidate, card, index) {
+  const keyInput = [
+    normalizeKeyText(candidate?.prompt || card?.prompt || card?.alt || ""),
+    normalizeKeyText(candidate?.date || card?.date || ""),
+    canonicalUrl(candidate?.thumbnailUrl || card?.thumbnailUrl || "")
+  ].filter(Boolean).join("|") || `image-${index || 0}`;
+
+  return `img-${shortHashText(`fallback:${keyInput}`, 16)}`;
+}
+
+function stableImageIdFromCandidate(candidate = {}, card = {}) {
+  const explicitIds = [
+    candidate.estuaryId,
+    candidate.fileId,
+    candidate.fileID,
+    candidate.file_id,
+    card.estuaryId,
+    card.fileId,
+    card.fileID,
+    card.file_id
+  ];
+  for (const value of explicitIds) {
+    const id = normalizeStableImageId(value);
+    if (id) {
+      return id;
+    }
+  }
+
+  const urls = [
+    candidate.url,
+    candidate.rawUrl,
+    candidate.sourceUrl,
+    candidate.originalUrl,
+    candidate.downloadUrl,
+    card.derivedOriginalUrl,
+    card.thumbnailUrl,
+    candidate.thumbnailUrl
+  ];
+  for (const url of urls) {
+    const id = stableImageIdFromUrl(url);
+    if (id) {
+      return id;
+    }
+  }
+
+  return "";
+}
+
+function stableImageIdFromUrl(url) {
+  const estuaryId = normalizedEstuaryContentId(url);
+  if (estuaryId) {
+    return `estuary:${estuaryId}`;
+  }
+
+  const fileId = normalizedFileId(url);
+  return fileId ? `file:${fileId}` : "";
+}
+
+function normalizeStableImageId(value) {
+  const text = String(value || "").trim().replace(/#thumbnail$/i, "");
+  if (!text) {
+    return "";
+  }
+
+  const fileMatch = text.match(/\bfile[-_][A-Za-z0-9_-]{8,}\b/);
+  if (fileMatch) {
+    return `file:${fileMatch[0]}`;
+  }
+
+  return `estuary:${text}`;
+}
+
+function normalizedFileId(url) {
+  if (!url) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(url, location.href);
+    const paramNames = ["file_id", "fileId", "file", "id"];
+    for (const name of paramNames) {
+      const value = parsed.searchParams.get(name) || "";
+      const match = value.match(/\bfile[-_][A-Za-z0-9_-]{8,}\b/);
+      if (match) {
+        return match[0];
+      }
+    }
+
+    const decoded = decodeURIComponent(`${parsed.pathname} ${parsed.search}`);
+    const match = decoded.match(/\bfile[-_][A-Za-z0-9_-]{8,}\b/);
+    return match ? match[0] : "";
+  } catch {
+    const match = String(url).match(/\bfile[-_][A-Za-z0-9_-]{8,}\b/);
+    return match ? match[0] : "";
+  }
+}
+
+function normalizedOriginalUrlForKey(url) {
+  const absoluteUrl = toAbsoluteUrl(url);
+  if (!absoluteUrl || isUiAssetUrl(absoluteUrl)) {
+    return "";
+  }
+
+  const originalUrl = normalizeOriginalDownloadUrl(absoluteUrl) || absoluteUrl;
+  if (!originalUrl || isUiAssetUrl(originalUrl)) {
+    return "";
+  }
+
+  if (sourceUrlLooksLikeThumbnail(originalUrl) && !deriveOriginalUrlFromThumbnail(originalUrl)) {
+    return "";
+  }
+
+  return canonicalizeImageUrlForKey(originalUrl);
+}
+
+function canonicalizeImageUrlForKey(url) {
+  try {
+    const parsed = new URL(url, location.href);
+
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      const lowerKey = key.toLowerCase();
+      if (
+        VOLATILE_IMAGE_KEY_PARAMS.has(lowerKey)
+        || lowerKey.startsWith("x-ms-")
+        || lowerKey.startsWith("x-amz-")
+      ) {
+        parsed.searchParams.delete(key);
+      }
+    }
+
+    const params = Array.from(parsed.searchParams.entries())
+      .sort(([leftKey, leftValue], [rightKey, rightValue]) => {
+        const keyCompare = leftKey.localeCompare(rightKey);
+        return keyCompare || leftValue.localeCompare(rightValue);
+      });
+    const search = params.length
+      ? `?${params.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join("&")}`
+      : "";
+    const hash = /^#?thumbnail$/i.test(parsed.hash || "") ? "" : parsed.hash;
+
+    return `${parsed.origin}${parsed.pathname}${search}${hash}`;
+  } catch {
+    return normalizeKeyText(url);
+  }
 }
 
 function sanitizeReportDiagnostic(value, maxLength = 2000) {
@@ -4349,49 +4506,55 @@ function addCandidate(seen, candidate) {
     return { status: "invalid", image: null };
   }
 
-  const key = canonicalUrl(candidate.url);
+  const candidateWithKey = candidate.imageKey
+    ? candidate
+    : {
+      ...candidate,
+      imageKey: buildResolvedImageKey(candidate, candidate, candidate.scanIndex || candidate.pageOrder || seen.size + 1)
+    };
+  const key = candidateWithKey.imageKey || canonicalUrl(candidateWithKey.url);
   const existing = seen.get(key);
 
   if (!existing) {
-    seen.set(key, candidate);
-    return { status: "added", image: candidate };
+    seen.set(key, candidateWithKey);
+    return { status: "added", image: candidateWithKey };
   }
 
-  if (!existing.date && candidate.date) {
-    existing.date = candidate.date;
+  if (!existing.date && candidateWithKey.date) {
+    existing.date = candidateWithKey.date;
   }
 
-  if (!existing.prompt && candidate.prompt) {
-    existing.prompt = candidate.prompt;
+  if (!existing.prompt && candidateWithKey.prompt) {
+    existing.prompt = candidateWithKey.prompt;
   }
 
-  if (!existing.thumbnailUrl && candidate.thumbnailUrl) {
-    existing.thumbnailUrl = candidate.thumbnailUrl;
+  if (!existing.thumbnailUrl && candidateWithKey.thumbnailUrl) {
+    existing.thumbnailUrl = candidateWithKey.thumbnailUrl;
   }
 
-  if ((candidate.width * candidate.height) > (existing.width * existing.height)) {
-    existing.width = candidate.width;
-    existing.height = candidate.height;
+  if ((candidateWithKey.width * candidateWithKey.height) > (existing.width * existing.height)) {
+    existing.width = candidateWithKey.width;
+    existing.height = candidateWithKey.height;
   }
 
-  if (!existing.scanIndex && candidate.scanIndex) {
-    existing.scanIndex = candidate.scanIndex;
+  if (!existing.scanIndex && candidateWithKey.scanIndex) {
+    existing.scanIndex = candidateWithKey.scanIndex;
   }
 
-  if (!existing.pageOrder && candidate.pageOrder) {
-    existing.pageOrder = candidate.pageOrder;
+  if (!existing.pageOrder && candidateWithKey.pageOrder) {
+    existing.pageOrder = candidateWithKey.pageOrder;
   }
 
-  if (!existing.imageKey && candidate.imageKey) {
-    existing.imageKey = candidate.imageKey;
+  if (!existing.imageKey && candidateWithKey.imageKey) {
+    existing.imageKey = candidateWithKey.imageKey;
   }
 
-  if (!existing.source && candidate.source) {
-    existing.source = candidate.source;
+  if (!existing.source && candidateWithKey.source) {
+    existing.source = candidateWithKey.source;
   }
 
-  if (!existing.position && candidate.position) {
-    existing.position = candidate.position;
+  if (!existing.position && candidateWithKey.position) {
+    existing.position = candidateWithKey.position;
   }
 
   return { status: "duplicate", image: existing };
@@ -4399,12 +4562,38 @@ function addCandidate(seen, candidate) {
 
 function canonicalUrl(url) {
   try {
-    const parsed = new URL(url);
+    const parsed = new URL(url, location.href);
     parsed.hash = "";
-    return parsed.href;
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      const lowerKey = key.toLowerCase();
+      if (
+        VOLATILE_IMAGE_KEY_PARAMS.has(lowerKey)
+        || lowerKey.startsWith("x-ms-")
+        || lowerKey.startsWith("x-amz-")
+      ) {
+        parsed.searchParams.delete(key);
+      }
+    }
+
+    const params = Array.from(parsed.searchParams.entries())
+      .sort(([leftKey, leftValue], [rightKey, rightValue]) => {
+        const keyCompare = leftKey.localeCompare(rightKey);
+        return keyCompare || leftValue.localeCompare(rightValue);
+      });
+    const search = params.length
+      ? `?${params.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join("&")}`
+      : "";
+
+    return `${parsed.origin}${parsed.pathname}${search}`;
   } catch {
-    return url;
+    return normalizeKeyText(url);
   }
+}
+
+function normalizeKeyText(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 function shortHashText(value, length = 8) {

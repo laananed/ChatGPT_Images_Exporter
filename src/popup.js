@@ -37,6 +37,7 @@ form.addEventListener("submit", async (event) => {
         tabId: tab.id,
         folder: settings.folder,
         accountLabel: settings.accountLabel,
+        downloadMode: settings.downloadMode,
         maxScrolls: settings.maxScrolls,
         delayMs: settings.delayMs
       }
@@ -130,15 +131,29 @@ async function restoreSettings() {
   document.querySelector("#account-label").value = settings.accountLabel || "";
   document.querySelector("#max-scrolls").value = settings.maxScrolls ?? 30;
   document.querySelector("#delay-ms").value = settings.delayMs ?? 400;
+  setDownloadMode(settings.downloadMode || "new");
 }
 
 function readSettings() {
   return {
     folder: document.querySelector("#folder").value.trim() || "ChatGPT Images",
     accountLabel: document.querySelector("#account-label").value.trim(),
+    downloadMode: selectedDownloadMode(),
     maxScrolls: numberInputValue("#max-scrolls", 30),
     delayMs: numberInputValue("#delay-ms", 0)
   };
+}
+
+function selectedDownloadMode() {
+  return document.querySelector('input[name="download-mode"]:checked')?.value === "all" ? "all" : "new";
+}
+
+function setDownloadMode(value) {
+  const mode = value === "all" ? "all" : "new";
+  const input = document.querySelector(`input[name="download-mode"][value="${mode}"]`);
+  if (input) {
+    input.checked = true;
+  }
 }
 
 function numberInputValue(selector, fallback) {
@@ -305,6 +320,7 @@ function jobMetrics(job = {}) {
     parseFailures: numberMetric(job.parseFailureCount ?? job.detailFailureCount ?? report?.parseFailures),
     qualityFailures: numberMetric(job.qualityFailureCount ?? job.qualityFailures ?? report?.qualityFailures),
     submittedDownloads: numberMetric(job.submittedDownloads ?? job.downloadStarted ?? report?.submittedDownloads),
+    skippedDuplicates: numberMetric(job.skippedDuplicateCount ?? job.skippedDuplicates ?? report?.skippedDuplicates),
     downloadFailures: numberMetric(job.downloadFailureCount ?? job.downloadFailures ?? report?.downloadFailures)
   };
 }
@@ -342,6 +358,7 @@ function formatMetricsLine(metrics) {
     `skipped ${metrics.skippedItems}`,
     `direct merged ${metrics.directMerged}`,
     `direct appended ${metrics.directAppended}`,
+    `跳过重复 ${metrics.skippedDuplicates} 张`,
     `已去重 ${deduplicatedItems} 张`,
     `提交下载 ${metrics.submittedDownloads} 张`,
     `下载提交失败 ${metrics.downloadFailures} 张`
@@ -394,8 +411,9 @@ function formatFailureReportForCopy(report) {
   const downloadFailures = Array.isArray(report.downloadFailures) ? report.downloadFailures : [];
   const scanList = Array.isArray(report.scanList) ? report.scanList : [];
   const skippedItems = Array.isArray(report.skippedItems) ? report.skippedItems : [];
+  const skippedDuplicates = Array.isArray(report.skippedDuplicates) ? report.skippedDuplicates : [];
 
-  if (!parseFailures.length && !qualityFailures.length && !downloadFailures.length && !skippedItems.length && !scanList.length) {
+  if (!parseFailures.length && !qualityFailures.length && !downloadFailures.length && !skippedItems.length && !skippedDuplicates.length && !scanList.length) {
     return "";
   }
 
@@ -411,6 +429,7 @@ function formatFailureReportForCopy(report) {
     deduplicatedItems: numberMetric(report.deduplicatedItems),
     deduplicatedItemSamples: Array.isArray(report.deduplicatedItemSamples) ? report.deduplicatedItemSamples : [],
     submittedDownloads: numberMetric(report.submittedDownloads),
+    skippedDuplicates,
     directResourceSummary: report.directResourceSummary || null,
     scanList,
     skippedItems,

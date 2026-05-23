@@ -84,6 +84,34 @@ input:focus {
   accent-color: #31745b;
 }
 
+fieldset {
+  margin: 0;
+  border: 1px solid #c8d0c4;
+  border-radius: 7px;
+  padding: 9px 10px;
+}
+
+legend {
+  padding: 0 4px;
+  color: #40483f;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-weight: 600;
+}
+
+.radio input {
+  width: 16px;
+  height: 16px;
+  accent-color: #31745b;
+}
+
 button {
   border: 0;
   border-radius: 7px;
@@ -177,6 +205,7 @@ button.secondary:disabled {
 
   p,
   label span,
+  legend,
   #status,
   .log-header h2 {
     color: #b7c0b2;
@@ -186,6 +215,10 @@ button.secondary:disabled {
     border-color: #3e493b;
     background: #20251f;
     color: #eef2ea;
+  }
+
+  fieldset {
+    border-color: #3e493b;
   }
 
   button {
