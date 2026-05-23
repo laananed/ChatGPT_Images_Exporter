@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Image Downloader</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>ChatGPT 图片下载</h1>
+        <p>在 ChatGPT 图片页面打开后使用</p>
+      </header>
+
+      <form id="download-form">
+        <label>
+          <span>下载文件夹</span>
+          <input id="folder" type="text" value="ChatGPT Images" maxlength="80">
+        </label>
+
+        <label>
+          <span>账号/标签（可选）</span>
+          <input id="account-label" type="text" maxlength="80" placeholder="default">
+        </label>
+
+        <div class="grid">
+          <label>
+            <span>滚动次数</span>
+            <input id="max-scrolls" type="number" min="0" max="250" value="30">
+          </label>
+
+          <label>
+            <span>档位间隔 ms</span>
+            <input id="delay-ms" type="number" min="0" max="5000" step="100" value="100" readonly>
+          </label>
+
+          <label>
+            <span>实际并发</span>
+            <input id="download-concurrency" type="number" min="1" max="3" value="2" readonly>
+          </label>
+        </div>
+
+        <fieldset class="speed-mode">
+          <legend>速度档位</legend>
+          <label class="radio">
+            <input type="radio" name="speed-mode" value="stable">
+            <span>稳定</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="speed-mode" value="standard" checked>
+            <span>标准</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="speed-mode" value="fast">
+            <span>快速</span>
+          </label>
+        </fieldset>
+
+        <fieldset class="download-mode">
+          <legend>下载模式</legend>
+          <label class="radio">
+            <input type="radio" name="download-mode" value="new" checked>
+            <span>只下载新增（推荐）</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="download-mode" value="all">
+            <span>下载全部</span>
+          </label>
+        </fieldset>
+
+        <fieldset class="date-filter">
+          <legend>时间范围过滤</legend>
+          <label class="radio">
+            <input type="radio" name="date-filter-mode" value="none" checked>
+            <span>不过滤</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="date-filter-mode" value="today">
+            <span>今天</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="date-filter-mode" value="custom">
+            <span>自定义开始时间 / 结束时间</span>
+          </label>
+          <div id="custom-date-range" class="date-range">
+            <label>
+              <span>开始时间</span>
+              <input id="date-start" type="datetime-local">
+            </label>
+            <label>
+              <span>结束时间</span>
+              <input id="date-end" type="datetime-local">
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="unknown-date-mode">
+          <legend>未知时间处理</legend>
+          <label class="radio">
+            <input type="radio" name="unknown-date-mode" value="skip" checked>
+            <span>跳过未知时间</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="unknown-date-mode" value="include">
+            <span>包含未知时间</span>
+          </label>
+        </fieldset>
+
+        <button id="start" type="submit">扫描并下载</button>
+      </form>
+
+      <section id="status" aria-live="polite"></section>
+
+      <section class="logs" aria-label="诊断日志">
+        <div class="log-header">
+          <h2>诊断日志</h2>
+          <div class="log-actions">
+            <button id="export-csv" class="secondary" type="button">导出 CSV</button>
+            <button id="retry-failed" class="secondary" type="button">重试失败项</button>
+            <button id="copy-failures" class="secondary" type="button">复制失败清单</button>
+            <button id="copy-logs" class="secondary" type="button">复制</button>
+            <button id="clear-logs" class="secondary" type="button">清空</button>
+          </div>
+        </div>
+        <pre id="log-list">暂无日志</pre>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

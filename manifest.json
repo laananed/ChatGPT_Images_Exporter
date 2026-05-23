@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Image Downloader",
+  "description": "Batch download generated images from your own ChatGPT pages.",
+  "version": "0.1.0",
+  "permissions": ["activeTab", "downloads", "scripting", "storage"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://persistent.oaistatic.com/*",
+    "https://oaidalleapiprodscus.blob.core.windows.net/*",
+    "https://*.oaidalleapiprodscus.blob.core.windows.net/*",
+    "https://images.openai.com/*",
+    "https://files.oaiusercontent.com/*",
+    "https://*.oaiusercontent.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "Download ChatGPT images",
+    "default_popup": "src/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
