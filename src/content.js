@@ -35,6 +35,13 @@ const URL_CANDIDATE_ATTRS = [
   "data-full-src",
   "data-download-url"
 ];
+const DATE_CANDIDATE_ATTRS = [
+  "datetime",
+  "title",
+  "aria-label",
+  "data-created-at",
+  "data-date"
+];
 const DIRECT_RESOURCE_CANDIDATE_LIMIT = 600;
 const PREPARED_IMAGE_OBJECT_URL_TTL_MS = 5 * 60 * 1000;
 const IMAGE_MIME_EXTENSIONS = {
@@ -402,6 +409,9 @@ function buildStableScanList(cardList) {
       thumbnailUrl: card.thumbnailUrl || "",
       prompt: card.prompt || card.alt || "",
       date: card.date || "",
+      dateSource: card.dateSource || "",
+      dateCandidates: card.dateCandidates || [],
+      dateCandidatesSummary: card.dateCandidatesSummary || "",
       position: normalizePosition(card.position),
       source: "card",
       card,
@@ -464,6 +474,9 @@ function createDirectResourceScanItem(directOriginal, scanIndex) {
     thumbnailUrl: directOriginal.thumbnailUrl || "",
     prompt: directOriginal.prompt || directOriginal.alt || "",
     date: directOriginal.date || "",
+    dateSource: directOriginal.dateSource || "",
+    dateCandidates: directOriginal.dateCandidates || [],
+    dateCandidatesSummary: directOriginal.dateCandidatesSummary || "",
     position: normalizePosition(directOriginal.position),
     source: "direct-resource",
     directSource: directOriginal.source || "",
@@ -473,7 +486,10 @@ function createDirectResourceScanItem(directOriginal, scanIndex) {
       pageOrder,
       imageKey,
       source: "direct-resource",
-      directSource: directOriginal.source || ""
+      directSource: directOriginal.source || "",
+      dateSource: directOriginal.dateSource || "",
+      dateCandidates: directOriginal.dateCandidates || [],
+      dateCandidatesSummary: directOriginal.dateCandidatesSummary || ""
     },
     directOriginals: [],
     directResourceDisposition: "appended",
@@ -576,11 +592,26 @@ function materializeScanImage(original, scanItem) {
     ? "direct-resource"
     : (original.source || scanItem.source || "card");
   const card = scanItem.card || scanItem;
+  const previousImageKey = scanItem.imageKey || "";
   const imageKey = buildResolvedImageKey(original, card, scanItem.scanIndex);
   scanItem.imageKey = imageKey || scanItem.imageKey;
   if (scanItem.card) {
     scanItem.card.imageKey = scanItem.imageKey;
   }
+  const dateInfo = mergeDateInfos(
+    {
+      date: original.date || null,
+      dateSource: original.dateSource || "",
+      dateCandidates: original.dateCandidates || [],
+      summary: original.dateCandidatesSummary || ""
+    },
+    {
+      date: scanItem.date || null,
+      dateSource: scanItem.dateSource || "",
+      dateCandidates: scanItem.dateCandidates || [],
+      summary: scanItem.dateCandidatesSummary || ""
+    }
+  );
 
   return {
     ...original,
@@ -589,10 +620,18 @@ function materializeScanImage(original, scanItem) {
     imageKey: scanItem.imageKey,
     thumbnailUrl: original.thumbnailUrl || scanItem.thumbnailUrl || "",
     prompt: original.prompt || scanItem.prompt || "",
-    date: original.date || scanItem.date || "",
+    date: dateInfo.date || "",
+    dateSource: dateInfo.dateSource || "",
+    dateCandidates: dateInfo.dateCandidates,
+    dateCandidatesSummary: dateInfo.summary,
     source,
     directSource: original.directSource || (scanItem.source === "direct-resource" ? scanItem.directSource : original.source || ""),
     resolutionSource: scanItem.resolutionSource || original.source || "",
+    retryImageKeys: Array.from(new Set([
+      previousImageKey,
+      original.imageKey,
+      scanItem.imageKey
+    ].filter(Boolean))),
     position: normalizePosition(scanItem.position),
     directResourceDisposition: scanItem.directResourceDisposition || ""
   };
@@ -606,6 +645,9 @@ function createScanListReport(scanList) {
     thumbnailUrl: summarizeUrl(item.thumbnailUrl),
     prompt: truncateReportText(item.prompt || "", 240),
     date: truncateReportText(item.date || "", 80),
+    dateSource: truncateReportText(item.dateSource || "", 120),
+    dateCandidates: normalizeDateCandidatesForReport(item.dateCandidates || []),
+    dateCandidatesSummary: item.dateCandidatesSummary || summarizeDateCandidates(item.dateCandidates || []),
     position: normalizePosition(item.position),
     source: item.source || "",
     status: item.status || "pending",
@@ -627,6 +669,9 @@ function createSkippedScanItem(scanItem, reason, stage, diagnostic = {}) {
     thumbnailUrl: summarizeUrl(scanItem.thumbnailUrl),
     prompt: truncateReportText(scanItem.prompt || "", 240),
     date: truncateReportText(scanItem.date || "", 80),
+    dateSource: truncateReportText(scanItem.dateSource || "", 120),
+    dateCandidates: normalizeDateCandidatesForReport(scanItem.dateCandidates || []),
+    dateCandidatesSummary: scanItem.dateCandidatesSummary || summarizeDateCandidates(scanItem.dateCandidates || []),
     source: scanItem.source || "",
     reason,
     stage,
@@ -807,6 +852,7 @@ function imageCardFromElement(img, stats = null, domOrder = 0) {
 
   const context = nearestUsefulContext(img);
   const clickTarget = findClickableTarget(img);
+  const dateInfo = findDateInfo(img, context, { scope: "card" });
 
   return {
     element: clickTarget,
@@ -814,7 +860,10 @@ function imageCardFromElement(img, stats = null, domOrder = 0) {
     context,
     thumbnailUrl: thumbnail.url,
     derivedOriginalUrl: deriveOriginalUrlFromThumbnail(thumbnail.url),
-    date: findDate(img, context),
+    date: dateInfo.date,
+    dateSource: dateInfo.dateSource,
+    dateCandidates: dateInfo.dateCandidates,
+    dateCandidatesSummary: dateInfo.summary,
     prompt: findPrompt(img, context),
     alt: img.getAttribute("alt") || img.getAttribute("aria-label") || "",
     width: Math.round(width),
@@ -864,6 +913,20 @@ async function resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index) 
 
   const candidates = collectImageUrlCandidates(detailRoot);
   const best = chooseBestCandidate(candidates, card.thumbnailUrl);
+  const detailDateInfo = findDateInfo(detailRoot, detailRoot, { scope: "detail" });
+  const dateInfo = mergeDateInfos(
+    {
+      date: card.date || null,
+      dateSource: card.dateSource || "",
+      dateCandidates: card.dateCandidates || [],
+      summary: card.dateCandidatesSummary || ""
+    },
+    detailDateInfo
+  );
+  card.date = card.date || dateInfo.date;
+  card.dateSource = card.dateSource || dateInfo.dateSource;
+  card.dateCandidates = dateInfo.dateCandidates;
+  card.dateCandidatesSummary = dateInfo.summary;
 
   await closeDetail(beforeHref);
 
@@ -905,7 +968,10 @@ async function resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index) 
 
   return {
     url: best.url,
-    date: card.date || findDate(detailRoot, detailRoot),
+    date: dateInfo.date,
+    dateSource: dateInfo.dateSource,
+    dateCandidates: dateInfo.dateCandidates,
+    dateCandidatesSummary: dateInfo.summary,
     prompt: card.prompt || findPrompt(detailRoot, detailRoot),
     alt: card.alt || detailRoot.getAttribute?.("aria-label") || "",
     thumbnailUrl: card.thumbnailUrl || "",
@@ -1229,7 +1295,10 @@ function addDirectOriginalCandidate(candidates, rawUrl, source, options = {}) {
     position: normalizePosition(options.position || options.card?.position),
     thumbnailUrl: options.card?.thumbnailUrl || "",
     prompt: options.card?.prompt || "",
-    date: options.card?.date || ""
+    date: options.card?.date || "",
+    dateSource: options.card?.dateSource || "",
+    dateCandidates: options.card?.dateCandidates || [],
+    dateCandidatesSummary: options.card?.dateCandidatesSummary || ""
   });
 }
 
@@ -1249,6 +1318,9 @@ function directResultsFromCandidates(candidates, cards) {
     .map((candidate) => {
       const card = candidate.card || findRelatedCardForCandidate(candidate.url, cards) || {
         date: null,
+        dateSource: candidate.dateSource || "",
+        dateCandidates: candidate.dateCandidates || [],
+        dateCandidatesSummary: candidate.dateCandidatesSummary || "",
         prompt: "",
         alt: "",
         thumbnailUrl: candidate.thumbnailUrl || "",
@@ -1407,9 +1479,26 @@ function urlsFromText(text) {
 }
 
 function imageResultFromCandidate(candidate, card) {
+  const dateInfo = mergeDateInfos(
+    {
+      date: card.date || null,
+      dateSource: card.dateSource || "",
+      dateCandidates: card.dateCandidates || [],
+      summary: card.dateCandidatesSummary || ""
+    },
+    {
+      date: candidate.date || null,
+      dateSource: candidate.dateSource || "",
+      dateCandidates: candidate.dateCandidates || [],
+      summary: candidate.dateCandidatesSummary || ""
+    }
+  );
   const result = {
     url: candidate.url,
-    date: card.date,
+    date: dateInfo.date,
+    dateSource: dateInfo.dateSource,
+    dateCandidates: dateInfo.dateCandidates,
+    dateCandidatesSummary: dateInfo.summary,
     prompt: card.prompt,
     alt: card.alt,
     thumbnailUrl: card.thumbnailUrl || "",
@@ -1450,6 +1539,9 @@ function createParseFailureItem(card, index, fallback = {}) {
     thumbnailUrl: summarizeUrl(card.thumbnailUrl),
     prompt: truncateReportText(card.prompt || card.alt || "", 240),
     date: truncateReportText(card.date || "", 80),
+    dateSource: truncateReportText(card.dateSource || "", 120),
+    dateCandidates: normalizeDateCandidatesForReport(card.dateCandidates || []),
+    dateCandidatesSummary: card.dateCandidatesSummary || summarizeDateCandidates(card.dateCandidates || []),
     source: truncateReportText(fallback.source || card.source || "", 80),
     reason,
     stage: truncateReportText(failure.stage || fallback.stage || "resolve", 80),
@@ -1472,6 +1564,15 @@ function createParseFailureItem(card, index, fallback = {}) {
 }
 
 function createDeduplicatedItem(card, original, index, scanItem = null) {
+  const dateInfo = mergeDateInfos(
+    {
+      date: scanItem?.date || card?.date || original.date || null,
+      dateSource: scanItem?.dateSource || card?.dateSource || original.dateSource || "",
+      dateCandidates: scanItem?.dateCandidates || card?.dateCandidates || original.dateCandidates || [],
+      summary: scanItem?.dateCandidatesSummary || card?.dateCandidatesSummary || original.dateCandidatesSummary || ""
+    }
+  );
+
   return {
     index,
     scanIndex: scanItem?.scanIndex || original.scanIndex || index,
@@ -1480,6 +1581,9 @@ function createDeduplicatedItem(card, original, index, scanItem = null) {
     thumbnailUrl: summarizeUrl(scanItem?.thumbnailUrl || card?.thumbnailUrl || original.thumbnailUrl),
     prompt: truncateReportText(scanItem?.prompt || card?.prompt || original.prompt || card?.alt || "", 240),
     date: truncateReportText(scanItem?.date || card?.date || original.date || "", 80),
+    dateSource: truncateReportText(dateInfo.dateSource || "", 120),
+    dateCandidates: normalizeDateCandidatesForReport(dateInfo.dateCandidates || []),
+    dateCandidatesSummary: dateInfo.summary || summarizeDateCandidates(dateInfo.dateCandidates || []),
     source: scanItem?.source || original.source || "",
     reason: "duplicate-original-url",
     stage: "dedupe",
@@ -1724,6 +1828,8 @@ async function prepareImageDownload(payload = {}) {
       ...detailBase,
       status: fetchResult.status,
       contentType: fetchResult.contentType,
+      responseDateHeaders: fetchResult.responseDateHeaders || null,
+      dateCandidates: fetchResult.dateCandidates || [],
       sourceUrl: fetchResult.responseUrl || url,
       requestLocation: "content-script",
       fetchMethod: "fetch",
@@ -1813,6 +1919,9 @@ async function prepareImageDownload(payload = {}) {
       urlIntegrityIssue: urlIntegrity.integrityIssue,
       pageImageContext: detailBase.pageImageContext,
       fetchLocation: "content-script",
+      responseDateHeaders: fetchResult.responseDateHeaders || null,
+      dateCandidates: fetchResult.dateCandidates || [],
+      fetchFailure: summarizePreparationAttempt(fetchResult),
       detailFallbackLocationsTried: detailFallbackResult?.locationsTried || [],
       fallbackLocationsTried: fallbackResult.locationsTried || []
     }
@@ -1845,6 +1954,8 @@ async function fetchPreparedImageBlob(url) {
   }
 
   const responseContentType = normalizeMimeType(response.headers.get("content-type") || "");
+  const responseDateHeaders = responseDateHeadersFromFetchHeaders(response.headers);
+  const responseDateCandidates = responseDateCandidatesFromHeaders(responseDateHeaders);
   if (!response.ok) {
     return {
       ok: false,
@@ -1852,6 +1963,8 @@ async function fetchPreparedImageBlob(url) {
       status: response.status,
       contentType: responseContentType,
       responseUrl: response.url || url,
+      responseDateHeaders,
+      dateCandidates: responseDateCandidates,
       requestLocation: "content-script",
       method: "fetch"
     };
@@ -1864,6 +1977,8 @@ async function fetchPreparedImageBlob(url) {
       status: response.status,
       contentType: responseContentType,
       responseUrl: response.url || url,
+      responseDateHeaders,
+      dateCandidates: responseDateCandidates,
       requestLocation: "content-script",
       method: "fetch"
     };
@@ -1876,6 +1991,8 @@ async function fetchPreparedImageBlob(url) {
       status: response.status,
       contentType: responseContentType,
       responseUrl: response.url || url,
+      responseDateHeaders,
+      dateCandidates: responseDateCandidates,
       requestLocation: "content-script",
       method: "fetch"
     };
@@ -1886,6 +2003,8 @@ async function fetchPreparedImageBlob(url) {
       status: response.status,
       contentType: responseContentType,
       responseUrl: response.url || url,
+      responseDateHeaders,
+      dateCandidates: responseDateCandidates,
       error: error?.message || String(error),
       requestLocation: "content-script",
       method: "fetch"
@@ -2025,6 +2144,8 @@ async function prepareImageFromDetailCandidates({ jobId, candidates, detailBase,
           ...detailBase,
           status: candidateFetch.status,
           contentType: candidateFetch.contentType,
+          responseDateHeaders: candidateFetch.responseDateHeaders || null,
+          dateCandidates: candidateFetch.dateCandidates || [],
           sourceUrl: candidateFetch.responseUrl || candidate.url,
           requestLocation: "content-script",
           fetchMethod: "detail-candidate-fetch",
@@ -2054,6 +2175,10 @@ async function prepareImageFromDetailCandidates({ jobId, candidates, detailBase,
           status: candidateFetch.status || 0,
           contentType: candidateFetch.contentType || "",
           error: candidateFetch.error || "",
+          diagnostic: {
+            responseDateHeaders: candidateFetch.responseDateHeaders || null,
+            dateCandidates: candidateFetch.dateCandidates || []
+          },
           url: summarizeUrl(candidate.url)
         });
       }
@@ -2334,6 +2459,9 @@ async function finalizePreparedImageBlob(jobId, blob, context = {}) {
     sourceUrl: context.sourceUrl || ""
   });
 
+  const dateInfo = mergeDateInfos({
+    dateCandidates: context.dateCandidates || []
+  });
   const result = {
     ok: true,
     downloadUrl,
@@ -2349,7 +2477,15 @@ async function finalizePreparedImageBlob(jobId, blob, context = {}) {
     sourceUrl: context.sourceUrl || "",
     width: quality.detail.width || 0,
     height: quality.detail.height || 0,
-    quality: quality.detail
+    date: dateInfo.date || "",
+    dateSource: dateInfo.dateSource || "",
+    quality: quality.detail,
+    diagnostic: sanitizeReportDiagnostic({
+      responseDateHeaders: context.responseDateHeaders || null,
+      dateCandidates: context.dateCandidates || []
+    }, 1200),
+    dateCandidates: dateInfo.dateCandidates,
+    dateCandidatesSummary: dateInfo.summary
   };
 
   reportLog(jobId, "info", "original-download-success", {
@@ -2383,6 +2519,9 @@ async function finalizePreparedImageBlob(jobId, blob, context = {}) {
 }
 
 function failPreparedImage(jobId, reason, detail) {
+  const dateInfo = mergeDateInfos({
+    dateCandidates: detail?.dateCandidates || detail?.validation?.dateCandidates || []
+  });
   const quality = normalizePreparedQuality(detail?.quality || detail?.validation, {
     width: detail?.width || 0,
     height: detail?.height || 0,
@@ -2398,6 +2537,10 @@ function failPreparedImage(jobId, reason, detail) {
     contentType: detail?.contentType || "",
     urlSummary: detail?.url || null,
     diagnostic: detail?.validation || detail || null,
+    date: dateInfo.date || "",
+    dateSource: dateInfo.dateSource || "",
+    dateCandidates: dateInfo.dateCandidates,
+    dateCandidatesSummary: dateInfo.summary,
     quality
   };
 
@@ -2647,6 +2790,8 @@ function summarizePreparationAttempt(attempt = {}) {
     requestLocation: attempt.requestLocation || "",
     method: attempt.method || attempt.fetchMethod || "",
     error: attempt.error || "",
+    responseDateHeaders: attempt.responseDateHeaders || undefined,
+    dateCandidates: attempt.dateCandidates || undefined,
     qualityFailure: attempt.qualityFailure || undefined,
     candidateCount: attempt.candidateCount || 0,
     failures: Array.isArray(attempt.failures) ? attempt.failures.slice(0, 3) : undefined,
@@ -4426,18 +4571,308 @@ function nearestUsefulContext(element) {
 }
 
 function findDate(element, context) {
-  const directTime = closestDateFromTimeElement(element) || closestDateFromTimeElement(context);
-  if (directTime) {
-    return directTime;
+  return findDateInfo(element, context).date || null;
+}
+
+const RESPONSE_LAST_MODIFIED_DATE_SOURCE = "response-header.last-modified";
+
+function findDateInfo(element, context, options = {}) {
+  const candidates = collectDateCandidates(element, context, options);
+  const selected = selectBestDateCandidate(candidates);
+
+  return {
+    date: selected?.normalizedDate || null,
+    dateSource: selected ? dateCandidateSourceLabel(selected) : "",
+    dateCandidates: normalizeDateCandidatesForReport(candidates),
+    summary: summarizeDateCandidates(candidates)
+  };
+}
+
+function collectDateCandidates(element, context, options = {}) {
+  const scope = options.scope || "card";
+  const candidates = [];
+  const roots = uniqueElements([
+    element,
+    context,
+    element?.parentElement,
+    context?.parentElement
+  ]).filter(Boolean);
+
+  for (const root of roots) {
+    collectTimeElementDateCandidates(candidates, root, scope);
+    collectElementAttributeDateCandidates(candidates, root, scope);
   }
 
-  const ariaDate = dateFromAttributes(element) || dateFromAttributes(context);
-  if (ariaDate) {
-    return ariaDate;
+  if (scope === "detail") {
+    collectTextDateCandidates(candidates, context?.innerText || "", `${scope}.visible-text`, "innerText");
+  } else {
+    collectAncestorTextDateCandidates(candidates, element, context, scope);
   }
 
-  const textDate = dateFromText(context?.innerText || "");
-  return textDate || null;
+  return dedupeDateCandidates(candidates);
+}
+
+function collectTimeElementDateCandidates(candidates, root, scope) {
+  if (!root) {
+    return;
+  }
+
+  const timeElements = uniqueElements([
+    root.closest?.("time"),
+    ...(root.querySelectorAll?.("time") || [])
+  ]).slice(0, 12);
+
+  for (const timeElement of timeElements) {
+    if (!timeElement) {
+      continue;
+    }
+
+    addDateCandidate(candidates, {
+      source: `${scope}.time`,
+      field: "datetime",
+      value: timeElement.dateTime || timeElement.getAttribute("datetime") || "",
+      element: timeElement
+    });
+
+    for (const attr of DATE_CANDIDATE_ATTRS.filter((name) => name !== "datetime")) {
+      addDateCandidate(candidates, {
+        source: `${scope}.time`,
+        field: attr,
+        value: timeElement.getAttribute(attr),
+        element: timeElement
+      });
+    }
+
+    addDateCandidate(candidates, {
+      source: `${scope}.time`,
+      field: "textContent",
+      value: timeElement.textContent,
+      element: timeElement
+    });
+  }
+}
+
+function collectElementAttributeDateCandidates(candidates, root, scope) {
+  if (!root?.getAttribute) {
+    return;
+  }
+
+  const selector = DATE_CANDIDATE_ATTRS.map((attr) => `[${attr}]`).join(",");
+  const elements = uniqueElements([
+    root,
+    root.closest?.(selector),
+    ...(root.querySelectorAll?.(selector) || [])
+  ]).slice(0, 24);
+
+  for (const element of elements) {
+    if (!element?.getAttribute) {
+      continue;
+    }
+
+    for (const attr of DATE_CANDIDATE_ATTRS) {
+      addDateCandidate(candidates, {
+        source: `${scope}.attr`,
+        field: attr,
+        value: element.getAttribute(attr),
+        element
+      });
+    }
+  }
+}
+
+function collectAncestorTextDateCandidates(candidates, element, context, scope) {
+  let current = element?.parentElement || context || null;
+  const seen = new Set();
+
+  for (let depth = 0; current && depth < 7; depth += 1) {
+    if (seen.has(current)) {
+      break;
+    }
+    seen.add(current);
+
+    collectTextDateCandidates(
+      candidates,
+      current.innerText || "",
+      `${scope}.parent-text`,
+      "innerText",
+      { depth }
+    );
+
+    if (current === document.body) {
+      break;
+    }
+    current = current.parentElement;
+  }
+}
+
+function collectTextDateCandidates(candidates, text, source, field, extra = {}) {
+  for (const candidate of dateFromTextCandidates(text)) {
+    addDateCandidate(candidates, {
+      source,
+      field,
+      value: candidate.value,
+      normalizedDate: candidate.normalizedDate,
+      ...extra
+    });
+  }
+}
+
+function addDateCandidate(candidates, candidate = {}) {
+  const value = String(candidate.value || "").trim().replace(/\s+/g, " ");
+  if (!value) {
+    return;
+  }
+
+  const normalizedDate = candidate.normalizedDate || normalizeDate(value) || dateFromText(value);
+  if (!normalizedDate && !shouldKeepUnparsedDateCandidate(candidate.field, value)) {
+    return;
+  }
+
+  candidates.push({
+    source: candidate.source || "",
+    field: candidate.field || "",
+    value: truncateReportText(value, 180),
+    normalizedDate: normalizedDate || "",
+    tag: candidate.element?.tagName?.toLowerCase?.() || candidate.tag || "",
+    depth: Number.isFinite(candidate.depth) ? candidate.depth : undefined
+  });
+}
+
+function shouldKeepUnparsedDateCandidate(field, value) {
+  const lowerField = String(field || "").toLowerCase();
+  return lowerField === "datetime"
+    || lowerField === "data-created-at"
+    || lowerField === "data-date"
+    || /\bdate\b|created|time/i.test(lowerField)
+    || /\b(?:today|yesterday)\b/i.test(value)
+    || /[\u4eca\u6628]\u5929/.test(value)
+    || /20\d{2}/.test(value);
+}
+
+function dedupeDateCandidates(candidates) {
+  const seen = new Set();
+  const result = [];
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") {
+      continue;
+    }
+
+    const key = [
+      candidate.source || "",
+      candidate.field || "",
+      candidate.value || "",
+      candidate.normalizedDate || "",
+      candidate.depth ?? ""
+    ].join("|");
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(candidate);
+    if (result.length >= 60) {
+      break;
+    }
+  }
+
+  return result;
+}
+
+function normalizeDateCandidatesForReport(candidates) {
+  if (!Array.isArray(candidates)) {
+    return [];
+  }
+
+  return dedupeDateCandidates(candidates)
+    .slice(0, 40)
+    .map((candidate) => {
+      const normalized = {
+        source: truncateReportText(candidate.source || "", 120),
+        field: truncateReportText(candidate.field || "", 80),
+        value: truncateReportText(candidate.value || "", 180),
+        normalizedDate: truncateReportText(candidate.normalizedDate || "", 80)
+      };
+
+      if (candidate.tag) {
+        normalized.tag = truncateReportText(candidate.tag, 40);
+      }
+      if (Number.isFinite(candidate.depth)) {
+        normalized.depth = candidate.depth;
+      }
+
+      return normalized;
+    });
+}
+
+function summarizeDateCandidates(candidates, maxEntries = 12) {
+  const normalized = normalizeDateCandidatesForReport(candidates).slice(0, maxEntries);
+  return normalized.map((candidate) => {
+    const source = [candidate.source, candidate.field].filter(Boolean).join(":") || "date";
+    const date = candidate.normalizedDate || "?";
+    return `${source}=${date} <= ${truncateReportText(candidate.value || "", 64)}`;
+  }).join(" | ");
+}
+
+function mergeDateInfos(...infos) {
+  const candidates = dedupeDateCandidates(infos.flatMap((info) => info?.dateCandidates || []));
+  const selectedInfo = infos.find((info) => info?.date && isFormalDateSource(info.dateSource)) || null;
+  const selectedCandidate = selectBestDateCandidate(candidates);
+  const date = selectedInfo?.date || selectedCandidate?.normalizedDate || null;
+  const dateSource = selectedInfo?.dateSource || (selectedCandidate ? dateCandidateSourceLabel(selectedCandidate) : "");
+
+  return {
+    date,
+    dateSource,
+    dateCandidates: normalizeDateCandidatesForReport(candidates),
+    summary: summarizeDateCandidates(candidates)
+  };
+}
+
+function selectBestDateCandidate(candidates) {
+  if (!Array.isArray(candidates)) {
+    return null;
+  }
+
+  return candidates.find((candidate) => candidate?.normalizedDate && isFormalDateCandidate(candidate)) || null;
+}
+
+function isFormalDateCandidate(candidate = {}) {
+  if (!candidate?.normalizedDate) {
+    return false;
+  }
+
+  return !isResponseHeaderDateCandidate(candidate) || isResponseHeaderLastModifiedCandidate(candidate);
+}
+
+function isResponseHeaderDateCandidate(candidate = {}) {
+  return String(candidate.source || "").toLowerCase().startsWith("response-header");
+}
+
+function isFormalDateSource(dateSource) {
+  const source = String(dateSource || "").toLowerCase();
+  return !source.startsWith("response-header")
+    || source === RESPONSE_LAST_MODIFIED_DATE_SOURCE
+    || source.startsWith(`${RESPONSE_LAST_MODIFIED_DATE_SOURCE}:`);
+}
+
+function isResponseHeaderLastModifiedCandidate(candidate = {}) {
+  const source = String(candidate.source || "").toLowerCase();
+  const field = String(candidate.field || "").toLowerCase();
+  return Boolean(candidate.normalizedDate)
+    && (
+      source === RESPONSE_LAST_MODIFIED_DATE_SOURCE
+      || (source === "response-header" && field === "last-modified")
+    );
+}
+
+function dateCandidateSourceLabel(candidate = {}) {
+  if (isResponseHeaderLastModifiedCandidate(candidate)) {
+    return RESPONSE_LAST_MODIFIED_DATE_SOURCE;
+  }
+
+  return [candidate.source, candidate.field].filter(Boolean).join(":");
 }
 
 function closestDateFromTimeElement(root) {
@@ -4466,23 +4901,54 @@ function dateFromAttributes(element) {
 }
 
 function dateFromText(text) {
-  const value = String(text || "").slice(0, 800);
-  const isoMatch = value.match(/\b(20\d{2})[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])\b/);
-  if (isoMatch) {
-    return normalizeDate(`${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`);
+  return dateFromTextCandidates(text)[0]?.normalizedDate || null;
+
+}
+
+function dateFromTextCandidates(text) {
+  const value = String(text || "").replace(/\s+/g, " ").slice(0, 2000);
+  const candidates = [];
+
+  for (const match of value.matchAll(/\b(20\d{2})[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])\b/g)) {
+    candidates.push({
+      value: match[0],
+      normalizedDate: normalizeDate(`${match[1]}-${match[2]}-${match[3]}`)
+    });
   }
 
-  const englishMatch = value.match(/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+20\d{2}\b/i);
-  if (englishMatch) {
-    return normalizeDate(englishMatch[0]);
+  for (const match of value.matchAll(/\b(20\d{2})\s*\u5e74\s*(0?[1-9]|1[0-2])\s*\u6708\s*(0?[1-9]|[12]\d|3[01])\s*\u65e5?/g)) {
+    candidates.push({
+      value: match[0],
+      normalizedDate: normalizeDate(`${match[1]}-${match[2]}-${match[3]}`)
+    });
   }
 
-  const chineseMatch = value.match(/\b(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\b/);
-  if (chineseMatch) {
-    return normalizeDate(`${chineseMatch[1]}-${chineseMatch[2]}-${chineseMatch[3]}`);
+  const englishMonth = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
+  const englishRe = new RegExp(`\\b${englishMonth}\\s+\\d{1,2},?\\s+20\\d{2}\\b`, "gi");
+  for (const match of value.matchAll(englishRe)) {
+    candidates.push({
+      value: match[0],
+      normalizedDate: normalizeDate(match[0])
+    });
   }
 
-  return null;
+  for (const match of value.matchAll(/\b(today|yesterday)\b|(\u4eca\u5929|\u6628\u5929)/gi)) {
+    candidates.push({
+      value: match[0],
+      normalizedDate: normalizeDate(match[0])
+    });
+  }
+
+  return dedupeDateCandidates(
+    candidates
+      .filter((candidate) => candidate.normalizedDate)
+      .map((candidate) => ({
+        source: "text",
+        field: "text",
+        value: candidate.value,
+        normalizedDate: candidate.normalizedDate
+      }))
+  );
 }
 
 function normalizeDate(value) {
@@ -4491,16 +4957,101 @@ function normalizeDate(value) {
   }
 
   const normalized = String(value).trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const relative = normalized.toLowerCase();
+  if (relative === "today" || normalized === "\u4eca\u5929") {
+    return relativeDateIso(0);
+  }
+  if (relative === "yesterday" || normalized === "\u6628\u5929") {
+    return relativeDateIso(-1);
+  }
+
+  const chineseDate = normalized.match(/\b(20\d{2})\s*\u5e74\s*(\d{1,2})\s*\u6708\s*(\d{1,2})\s*\u65e5?/);
+  if (chineseDate) {
+    return localDatePartsToIso(Number(chineseDate[1]), Number(chineseDate[2]), Number(chineseDate[3]));
+  }
+
+  const dateOnly = normalized.match(/^(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+  if (dateOnly) {
+    return localDatePartsToIso(Number(dateOnly[1]), Number(dateOnly[2]), Number(dateOnly[3]));
+  }
+
   const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) {
     const parts = normalized.match(/\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b/);
     if (!parts) {
       return null;
     }
-    return new Date(Number(parts[1]), Number(parts[2]) - 1, Number(parts[3])).toISOString();
+    return localDatePartsToIso(Number(parts[1]), Number(parts[2]), Number(parts[3]));
   }
 
   return date.toISOString();
+}
+
+function localDatePartsToIso(year, month, day) {
+  const date = new Date(year, month - 1, day);
+  if (
+    date.getFullYear() !== year
+    || date.getMonth() !== month - 1
+    || date.getDate() !== day
+  ) {
+    return null;
+  }
+
+  return date.toISOString();
+}
+
+function relativeDateIso(dayOffset) {
+  const date = new Date();
+  date.setDate(date.getDate() + dayOffset);
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).toISOString();
+}
+
+function responseDateHeadersFromFetchHeaders(headers) {
+  if (!headers?.get) {
+    return null;
+  }
+
+  const result = {};
+  for (const name of ["last-modified", "date", "x-ms-creation-time", "etag"]) {
+    const value = headers.get(name);
+    if (value) {
+      result[name] = truncateReportText(value, 180);
+    }
+  }
+
+  return Object.keys(result).length ? result : null;
+}
+
+function responseDateCandidatesFromHeaders(headers) {
+  const candidates = [];
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (String(name).toLowerCase() === "etag") {
+      const etag = String(value || "").trim().replace(/\s+/g, " ");
+      if (etag) {
+        candidates.push({
+          source: "response-header.etag",
+          field: "etag",
+          value: truncateReportText(etag, 180),
+          normalizedDate: "",
+          tag: "response"
+        });
+      }
+      continue;
+    }
+
+    addDateCandidate(candidates, {
+      source: `response-header.${name}`,
+      field: name,
+      value,
+      tag: "response"
+    });
+  }
+
+  return normalizeDateCandidatesForReport(candidates);
 }
 
 function findPrompt(element, context) {

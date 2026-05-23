@@ -2,30 +2,56 @@ const form = document.querySelector("#download-form");
 const startButton = document.querySelector("#start");
 const statusEl = document.querySelector("#status");
 const logListEl = document.querySelector("#log-list");
+const exportCsvButton = document.querySelector("#export-csv");
+const retryFailedButton = document.querySelector("#retry-failed");
 const copyFailuresButton = document.querySelector("#copy-failures");
 const copyLogsButton = document.querySelector("#copy-logs");
 const clearLogsButton = document.querySelector("#clear-logs");
 const POLL_INTERVAL_MS = 1000;
 const DEFAULT_SPEED_MODE = "standard";
+const DEFAULT_DATE_FILTER_MODE = "none";
+const DEFAULT_UNKNOWN_DATE_MODE = "skip";
 const SPEED_PRESETS = {
   stable: { label: "稳定", concurrency: 1, delayMs: 400 },
   standard: { label: "标准", concurrency: 2, delayMs: 100 },
   fast: { label: "快速", concurrency: 3, delayMs: 0 }
 };
+const CSV_COLUMNS = [
+  "jobId",
+  "rowType",
+  "scanIndex",
+  "imageKey",
+  "date",
+  "dateSource",
+  "dateCandidatesSummary",
+  "prompt",
+  "sourceUrl",
+  "filename",
+  "status",
+  "stage",
+  "reason"
+];
+const RESPONSE_LAST_MODIFIED_DATE_SOURCE = "response-header.last-modified";
 
 let pollTimer = null;
 let latestLogs = [];
 let latestJobReport = null;
+let latestJobIsBusy = false;
 
 document.querySelectorAll('input[name="speed-mode"]').forEach((input) => {
   input.addEventListener("change", syncSpeedPresetControls);
 });
+document.querySelectorAll('input[name="date-filter-mode"]').forEach((input) => {
+  input.addEventListener("change", syncDateFilterControls);
+});
 
 syncSpeedPresetControls();
+syncDateFilterControls();
 restoreSettings();
 refreshJobStatus();
 refreshJobReport();
 refreshJobLogs();
+syncReportActionButtons();
 startPolling();
 
 form.addEventListener("submit", async (event) => {
@@ -35,6 +61,7 @@ form.addEventListener("submit", async (event) => {
 
   try {
     const settings = readSettings();
+    validateSettings(settings);
     await chrome.storage.local.set({ settings });
 
     const tab = await getActiveTab();
@@ -49,6 +76,7 @@ form.addEventListener("submit", async (event) => {
         folder: settings.folder,
         accountLabel: settings.accountLabel,
         downloadMode: settings.downloadMode,
+        dateFilter: settings.dateFilter,
         maxScrolls: settings.maxScrolls,
         speedMode: settings.speedMode,
         downloadConcurrency: settings.downloadConcurrency,
@@ -87,6 +115,80 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   const reportChange = changes.jobReport || changes.imageJobReport || changes.jobManifest;
   if (reportChange?.newValue) {
     latestJobReport = reportChange.newValue;
+    syncReportActionButtons();
+  }
+});
+
+exportCsvButton.addEventListener("click", async () => {
+  try {
+    const report = latestJobReport || await readLatestJobReport();
+    const rows = collectJobReportCsvRows(report);
+    if (!rows.length) {
+      setStatus("当前没有可导出的 jobReport 清单。");
+      flashButtonText(exportCsvButton, "无清单");
+      return;
+    }
+
+    const csv = formatCsv(rows);
+    const filename = buildCsvFilename(report);
+    await downloadCsvFile(csv, filename);
+    setStatus(`已导出 CSV 清单：${rows.length} 行。`, "success");
+    flashButtonText(exportCsvButton, "已导出");
+  } catch (error) {
+    setStatus(`导出 CSV 失败：${error?.message || String(error)}`, "error");
+  }
+});
+
+retryFailedButton.addEventListener("click", async () => {
+  setBusy(true);
+  setStatus("准备重试失败项...");
+
+  try {
+    const report = latestJobReport || await readLatestJobReport();
+    if (!hasRetryableFailures(report)) {
+      setStatus("当前 jobReport 没有可重试的解析失败或下载失败项。");
+      flashButtonText(retryFailedButton, "无失败");
+      setBusy(false);
+      return;
+    }
+
+    const settings = readSettings();
+    validateSettings(settings);
+    await chrome.storage.local.set({ settings });
+
+    const tab = await getActiveTab();
+    if (!tab?.id || !isChatGptUrl(tab.url)) {
+      throw new Error("请先打开 chatgpt.com 的图片页面，再重试失败项。");
+    }
+
+    const response = await chrome.runtime.sendMessage({
+      type: "START_FAILED_ITEMS_RETRY",
+      payload: {
+        tabId: tab.id,
+        retryOfJobId: report.jobId || "",
+        folder: settings.folder,
+        accountLabel: settings.accountLabel,
+        downloadMode: settings.downloadMode,
+        dateFilter: settings.dateFilter,
+        maxScrolls: settings.maxScrolls,
+        speedMode: settings.speedMode,
+        downloadConcurrency: settings.downloadConcurrency,
+        delayMs: settings.delayMs
+      }
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "失败项重试启动失败。");
+    }
+
+    renderJobStatus(response.result);
+    await refreshJobLogs();
+  } catch (error) {
+    await recordPopupLog("error", "失败项重试启动失败", {
+      reason: error?.message || String(error)
+    }, "retry");
+    setStatus(error.message || String(error), "error");
+    setBusy(false);
   }
 });
 
@@ -146,6 +248,8 @@ async function restoreSettings() {
   setSpeedMode(settings.speedMode || DEFAULT_SPEED_MODE);
   syncSpeedPresetControls();
   setDownloadMode(settings.downloadMode || "new");
+  setDateFilter(settings.dateFilter || {});
+  syncDateFilterControls();
 }
 
 function readSettings() {
@@ -155,6 +259,7 @@ function readSettings() {
     folder: document.querySelector("#folder").value.trim() || "ChatGPT Images",
     accountLabel: document.querySelector("#account-label").value.trim(),
     downloadMode: selectedDownloadMode(),
+    dateFilter: selectedDateFilter(),
     speedMode,
     downloadConcurrency: speedPreset.concurrency,
     maxScrolls: numberInputValue("#max-scrolls", 30),
@@ -166,6 +271,26 @@ function selectedDownloadMode() {
   return document.querySelector('input[name="download-mode"]:checked')?.value === "all" ? "all" : "new";
 }
 
+function selectedDateFilter() {
+  return {
+    mode: selectedDateFilterMode(),
+    start: document.querySelector("#date-start")?.value || "",
+    end: document.querySelector("#date-end")?.value || "",
+    unknownDateMode: selectedUnknownDateMode()
+  };
+}
+
+function selectedDateFilterMode() {
+  const value = document.querySelector('input[name="date-filter-mode"]:checked')?.value;
+  return value === "today" || value === "custom" ? value : DEFAULT_DATE_FILTER_MODE;
+}
+
+function selectedUnknownDateMode() {
+  return document.querySelector('input[name="unknown-date-mode"]:checked')?.value === "include"
+    ? "include"
+    : DEFAULT_UNKNOWN_DATE_MODE;
+}
+
 function selectedSpeedMode() {
   return normalizeSpeedMode(document.querySelector('input[name="speed-mode"]:checked')?.value);
 }
@@ -173,6 +298,35 @@ function selectedSpeedMode() {
 function setDownloadMode(value) {
   const mode = value === "all" ? "all" : "new";
   const input = document.querySelector(`input[name="download-mode"][value="${mode}"]`);
+  if (input) {
+    input.checked = true;
+  }
+}
+
+function setDateFilter(value = {}) {
+  setDateFilterMode(value.mode || value.dateFilterMode || DEFAULT_DATE_FILTER_MODE);
+  setUnknownDateMode(value.unknownDateMode || DEFAULT_UNKNOWN_DATE_MODE);
+  const startInput = document.querySelector("#date-start");
+  const endInput = document.querySelector("#date-end");
+  if (startInput) {
+    startInput.value = value.startInput || value.customStart || normalizeDateInputForControl(value.start) || "";
+  }
+  if (endInput) {
+    endInput.value = value.endInput || value.customEnd || normalizeDateInputForControl(value.end) || "";
+  }
+}
+
+function setDateFilterMode(value) {
+  const mode = value === "today" || value === "custom" ? value : DEFAULT_DATE_FILTER_MODE;
+  const input = document.querySelector(`input[name="date-filter-mode"][value="${mode}"]`);
+  if (input) {
+    input.checked = true;
+  }
+}
+
+function setUnknownDateMode(value) {
+  const mode = value === "include" ? "include" : DEFAULT_UNKNOWN_DATE_MODE;
+  const input = document.querySelector(`input[name="unknown-date-mode"][value="${mode}"]`);
   if (input) {
     input.checked = true;
   }
@@ -209,6 +363,68 @@ function syncSpeedPresetControls() {
   }
 }
 
+function syncDateFilterControls() {
+  const isCustom = selectedDateFilterMode() === "custom";
+  const range = document.querySelector("#custom-date-range");
+  const startInput = document.querySelector("#date-start");
+  const endInput = document.querySelector("#date-end");
+  if (range) {
+    range.hidden = !isCustom;
+  }
+  if (startInput) {
+    startInput.disabled = !isCustom;
+  }
+  if (endInput) {
+    endInput.disabled = !isCustom;
+  }
+}
+
+function validateSettings(settings) {
+  const filter = settings?.dateFilter || {};
+  if (filter.mode !== "custom") {
+    return;
+  }
+
+  const start = parseDateInputValue(filter.start);
+  const end = parseDateInputValue(filter.end);
+  if (start !== null && end !== null && start > end) {
+    throw new Error("自定义结束时间不能早于开始时间。");
+  }
+}
+
+function parseDateInputValue(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const date = new Date(text);
+  const timestamp = date.getTime();
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function dateTimeLocalValue(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return "";
+  }
+
+  const date = new Date(timestamp);
+  return [
+    `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`,
+    `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`
+  ].join("T");
+}
+
+function normalizeDateInputForControl(value) {
+  const text = String(value || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(text)) {
+    return text.slice(0, 16);
+  }
+
+  return dateTimeLocalValue(value);
+}
+
 function numberInputValue(selector, fallback) {
   const raw = document.querySelector(selector).value;
   if (raw === "") {
@@ -236,11 +452,260 @@ async function refreshJobReport() {
   } catch {
     latestJobReport = null;
   }
+  syncReportActionButtons();
 }
 
 async function readLatestJobReport() {
   const result = await chrome.storage.local.get(["jobReport", "jobManifest", "imageJobReport"]);
   return result.jobReport || result.imageJobReport || result.jobManifest || null;
+}
+
+function syncReportActionButtons() {
+  const hasReport = Boolean(latestJobReport && typeof latestJobReport === "object");
+  exportCsvButton.disabled = !hasReport;
+  retryFailedButton.disabled = latestJobIsBusy || !hasRetryableFailures(latestJobReport);
+}
+
+function hasRetryableFailures(report) {
+  if (!report || typeof report !== "object") {
+    return false;
+  }
+
+  return arrayField(report, "parseFailures").length > 0
+    || arrayField(report, "downloadFailures").length > 0;
+}
+
+function buildCsvFilename(report = {}) {
+  const jobId = String(report?.jobId || "job").replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "");
+  const stamp = report?.startedAt
+    ? new Date(Number(report.startedAt)).toISOString().replace(/[:.]/g, "-")
+    : new Date().toISOString().replace(/[:.]/g, "-");
+  return `chatgpt-images-${jobId || "job"}-${stamp}.csv`;
+}
+
+function collectJobReportCsvRows(report) {
+  if (!report || typeof report !== "object") {
+    return [];
+  }
+
+  const rows = [];
+  const jobId = String(report.jobId || "");
+
+  appendCsvRows(rows, jobId, "scan", arrayField(report, "scanList"), {
+    status: (item) => item.status || "scanned",
+    stage: "scan",
+    reason: (item) => item.reason || "",
+    sourceUrl: (item) => item.sourceUrl || item.resolvedUrl || item.thumbnailUrl || ""
+  });
+  appendCsvRows(rows, jobId, "submitted", arrayField(report, "submittedItems"), {
+    status: "submitted",
+    stage: (item) => item.stage || "download",
+    reason: (item) => item.reason || "",
+    filename: (item) => item.filename || "",
+    sourceUrl: (item) => item.sourceUrl || item.url || ""
+  });
+  appendCsvRows(rows, jobId, "history-duplicate", arrayField(report, "skippedDuplicates"), {
+    status: "skipped-duplicate",
+    stage: (item) => item.stage || "history-dedupe",
+    reason: (item) => item.reason || "skippedDuplicate",
+    filename: (item) => item.previousFilename || item.filename || "",
+    sourceUrl: (item) => item.sourceUrl || item.url || ""
+  });
+  appendCsvRows(rows, jobId, "scan-skipped", arrayField(report, "skippedItems"), {
+    status: "skipped",
+    stage: (item) => item.stage || "skip",
+    reason: (item) => item.reason || "",
+    sourceUrl: extractReportItemSourceUrl
+  });
+  appendCsvRows(rows, jobId, "time-filter-skipped", arrayField(report, "timeRangeSkippedItems"), {
+    status: "skipped-time-range",
+    stage: (item) => item.stage || "date-filter",
+    reason: (item) => item.reason || "outside-date-range",
+    sourceUrl: extractReportItemSourceUrl
+  });
+  appendCsvRows(rows, jobId, "unknown-date-skipped", arrayField(report, "unknownDateSkippedItems"), {
+    status: "skipped-unknown-date",
+    stage: (item) => item.stage || "date-filter",
+    reason: (item) => item.reason || "unknown-date-skipped",
+    sourceUrl: extractReportItemSourceUrl
+  });
+  appendCsvRows(rows, jobId, "unknown-date-included", arrayField(report, "unknownDateIncludedItems"), {
+    status: "unknown-date-included",
+    stage: (item) => item.stage || "date-filter",
+    reason: (item) => item.reason || "unknown-date-included",
+    sourceUrl: extractReportItemSourceUrl
+  });
+  appendCsvRows(rows, jobId, "parse-failure", arrayField(report, "parseFailures"), {
+    status: "failed",
+    stage: (item) => item.stage || "resolve",
+    reason: (item) => item.reason || "parse-failed",
+    sourceUrl: extractReportItemSourceUrl
+  });
+  appendCsvRows(rows, jobId, "quality-failure", arrayField(report, "qualityFailures"), {
+    status: "failed",
+    stage: (item) => item.stage || "quality-check",
+    reason: (item) => item.reason || item.quality?.rejectReason || "quality-failed",
+    sourceUrl: extractReportItemSourceUrl
+  });
+  appendCsvRows(rows, jobId, "download-failure", arrayField(report, "downloadFailures"), {
+    status: "failed",
+    stage: (item) => item.stage || "download",
+    reason: (item) => item.reason || "download-failed",
+    sourceUrl: extractReportItemSourceUrl
+  });
+
+  return rows;
+}
+
+function appendCsvRows(rows, jobId, rowType, items, mapping = {}) {
+  for (const item of items) {
+    const dateInfo = dateInfoForCsv(item);
+    rows.push({
+      jobId,
+      rowType,
+      scanIndex: item.scanIndex || item.index || "",
+      imageKey: item.imageKey || "",
+      date: dateInfo.date,
+      dateSource: dateInfo.dateSource,
+      dateCandidatesSummary: dateCandidatesSummaryForCsv(item),
+      prompt: item.prompt || item.alt || "",
+      sourceUrl: valueFromMapping(mapping.sourceUrl, item, ""),
+      filename: valueFromMapping(mapping.filename, item, ""),
+      status: valueFromMapping(mapping.status, item, ""),
+      stage: valueFromMapping(mapping.stage, item, ""),
+      reason: valueFromMapping(mapping.reason, item, "")
+    });
+  }
+}
+
+function valueFromMapping(mapping, item, fallback) {
+  if (typeof mapping === "function") {
+    return mapping(item);
+  }
+  if (mapping !== undefined) {
+    return mapping;
+  }
+  return fallback;
+}
+
+function dateInfoForCsv(item = {}) {
+  if (item.date) {
+    return {
+      date: item.date,
+      dateSource: item.dateSource || item.diagnostic?.dateSource || ""
+    };
+  }
+
+  const fallback = dateCandidatesForCsv(item).find((candidate) => {
+    const source = String(candidate.source || "").toLowerCase();
+    const field = String(candidate.field || "").toLowerCase();
+    return candidate.normalizedDate
+      && (
+        source === RESPONSE_LAST_MODIFIED_DATE_SOURCE
+        || (source === "response-header" && field === "last-modified")
+      );
+  });
+
+  return {
+    date: fallback?.normalizedDate || "",
+    dateSource: fallback ? RESPONSE_LAST_MODIFIED_DATE_SOURCE : (item.dateSource || item.diagnostic?.dateSource || "")
+  };
+}
+
+function extractReportItemSourceUrl(item = {}) {
+  return item.sourceUrl
+    || item.url
+    || item.resolvedUrl
+    || item.thumbnailUrl
+    || item.diagnostic?.sourceUrl
+    || item.diagnostic?.targetUrl
+    || item.diagnostic?.url
+    || item.diagnostic?.originalUrl
+    || "";
+}
+
+function dateCandidatesSummaryForCsv(item = {}) {
+  if (item.dateCandidatesSummary) {
+    return item.dateCandidatesSummary;
+  }
+
+  const candidates = dateCandidatesForCsv(item);
+
+  return candidates.slice(0, 12).map((candidate) => {
+    const source = [candidate.source, candidate.field].filter(Boolean).join(":") || "date";
+    const date = candidate.normalizedDate || "?";
+    return `${source}=${date} <= ${String(candidate.value || "").slice(0, 64)}`;
+  }).join(" | ");
+}
+
+function dateCandidatesForCsv(item = {}) {
+  return [
+    ...(Array.isArray(item.dateCandidates) ? item.dateCandidates : []),
+    ...(Array.isArray(item.diagnostic?.dateCandidates) ? item.diagnostic.dateCandidates : []),
+    ...(Array.isArray(item.diagnostic?.responseDateCandidates) ? item.diagnostic.responseDateCandidates : []),
+    ...(Array.isArray(item.diagnostic?.fetchFailure?.dateCandidates) ? item.diagnostic.fetchFailure.dateCandidates : []),
+    ...(Array.isArray(item.diagnostic?.validation?.dateCandidates) ? item.diagnostic.validation.dateCandidates : []),
+    ...(Array.isArray(item.diagnostic?.diagnostic?.dateCandidates) ? item.diagnostic.diagnostic.dateCandidates : []),
+    ...(Array.isArray(item.diagnostic?.diagnostic?.fetchFailure?.dateCandidates) ? item.diagnostic.diagnostic.fetchFailure.dateCandidates : []),
+    ...(Array.isArray(item.diagnostic?.diagnostic?.validation?.dateCandidates) ? item.diagnostic.diagnostic.validation.dateCandidates : [])
+  ];
+}
+
+function formatCsv(rows) {
+  return [
+    CSV_COLUMNS.join(","),
+    ...rows.map((row) => CSV_COLUMNS.map((column) => csvEscape(row[column])).join(","))
+  ].join("\n");
+}
+
+function csvEscape(value) {
+  const text = csvCellText(value);
+  return /[",\r\n]/.test(text)
+    ? `"${text.replace(/"/g, '""')}"`
+    : text;
+}
+
+function csvCellText(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+async function downloadCsvFile(csv, filename) {
+  const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+
+  try {
+    if (chrome.downloads?.download) {
+      await chrome.downloads.download({
+        url,
+        filename,
+        saveAs: true
+      });
+      return;
+    }
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+}
+
+function arrayField(source, key) {
+  return Array.isArray(source?.[key]) ? source[key] : [];
 }
 
 async function refreshJobLogs() {
@@ -382,6 +847,10 @@ function jobMetrics(job = {}) {
     averageDownloadsPerMinute: numberMetric(report?.averageDownloadsPerMinute) || rateMetric(submittedDownloads, rateDurationMs, 60000),
     scanListItems: numberMetric(job.scanListItems ?? report?.scanListItems ?? report?.scanList),
     scannedItems: numberMetric(job.scannedItems ?? job.scanned ?? report?.scannedItems),
+    filteredIn: numberMetric(job.filteredIn ?? report?.filteredIn),
+    filteredOut: numberMetric(job.filteredOut ?? report?.filteredOut),
+    unknownDateCount: numberMetric(job.unknownDateCount ?? report?.unknownDateCount),
+    unknownDateMode: job.unknownDateMode || job.dateFilter?.unknownDateMode || job.settings?.dateFilter?.unknownDateMode || report?.dateFilter?.unknownDateMode || DEFAULT_UNKNOWN_DATE_MODE,
     resolvedCardItems: numberMetric(job.resolvedCardItems ?? report?.resolvedCardItems),
     resolvedItems: numberMetric(job.resolvedItems ?? job.matched ?? report?.resolvedItems),
     deduplicatedItems: numberMetric(job.deduplicatedItems ?? report?.deduplicatedItems),
@@ -438,6 +907,10 @@ function formatRate(value, unit) {
   return `${number.toFixed(number >= 10 ? 1 : 2).replace(/\.?0+$/, "")}${unit}`;
 }
 
+function unknownDateModeLabel(value) {
+  return value === "include" ? "包含未知时间" : "跳过未知时间";
+}
+
 function formatMetricsLine(metrics) {
   const resolvedCardItems = metrics.resolvedCardItems
     || Math.max(metrics.scannedItems - metrics.parseFailures, metrics.resolvedItems);
@@ -452,6 +925,11 @@ function formatMetricsLine(metrics) {
     `并发 ${metrics.downloadConcurrency}`,
     `delay ${metrics.delayMs}ms`,
     `scanList ${metrics.scanListItems || metrics.scannedItems}`,
+    `扫描总数 ${metrics.scanListItems || metrics.scannedItems} 张`,
+    `时间过滤后保留 ${metrics.filteredIn} 张`,
+    `时间过滤跳过 ${metrics.filteredOut} 张`,
+    `未知时间 ${metrics.unknownDateCount} 张`,
+    `未知时间处理 ${unknownDateModeLabel(metrics.unknownDateMode)}`,
     `质量失败 ${metrics.qualityFailures} 张`,
     `扫描 ${metrics.scannedItems} 张`,
     `解析成功 ${resolvedCardItems} 张`,
@@ -515,8 +993,11 @@ function formatFailureReportForCopy(report) {
   const scanList = Array.isArray(report.scanList) ? report.scanList : [];
   const skippedItems = Array.isArray(report.skippedItems) ? report.skippedItems : [];
   const skippedDuplicates = Array.isArray(report.skippedDuplicates) ? report.skippedDuplicates : [];
+  const timeRangeSkippedItems = Array.isArray(report.timeRangeSkippedItems) ? report.timeRangeSkippedItems : [];
+  const unknownDateSkippedItems = Array.isArray(report.unknownDateSkippedItems) ? report.unknownDateSkippedItems : [];
+  const unknownDateIncludedItems = Array.isArray(report.unknownDateIncludedItems) ? report.unknownDateIncludedItems : [];
 
-  if (!parseFailures.length && !qualityFailures.length && !downloadFailures.length && !skippedItems.length && !skippedDuplicates.length && !scanList.length) {
+  if (!parseFailures.length && !qualityFailures.length && !downloadFailures.length && !skippedItems.length && !skippedDuplicates.length && !timeRangeSkippedItems.length && !unknownDateSkippedItems.length && !unknownDateIncludedItems.length && !scanList.length) {
     return "";
   }
 
@@ -541,6 +1022,13 @@ function formatFailureReportForCopy(report) {
     deduplicatedItemSamples: Array.isArray(report.deduplicatedItemSamples) ? report.deduplicatedItemSamples : [],
     submittedDownloads: numberMetric(report.submittedDownloads),
     skippedDuplicates,
+    dateFilter: report.dateFilter || null,
+    filteredIn: numberMetric(report.filteredIn),
+    filteredOut: numberMetric(report.filteredOut),
+    unknownDateCount: numberMetric(report.unknownDateCount),
+    timeRangeSkippedItems,
+    unknownDateSkippedItems,
+    unknownDateIncludedItems,
     directResourceSummary: report.directResourceSummary || null,
     scanList,
     skippedItems,
@@ -577,7 +1065,9 @@ function isChatGptUrl(url) {
 }
 
 function setBusy(isBusy) {
+  latestJobIsBusy = Boolean(isBusy);
   startButton.disabled = isBusy;
+  retryFailedButton.disabled = latestJobIsBusy || !hasRetryableFailures(latestJobReport);
   startButton.textContent = isBusy ? "处理中..." : "扫描并下载";
 }
 

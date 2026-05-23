@@ -69,6 +69,44 @@
           </label>
         </fieldset>
 
+        <fieldset class="date-filter">
+          <legend>时间范围过滤</legend>
+          <label class="radio">
+            <input type="radio" name="date-filter-mode" value="none" checked>
+            <span>不过滤</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="date-filter-mode" value="today">
+            <span>今天</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="date-filter-mode" value="custom">
+            <span>自定义开始时间 / 结束时间</span>
+          </label>
+          <div id="custom-date-range" class="date-range">
+            <label>
+              <span>开始时间</span>
+              <input id="date-start" type="datetime-local">
+            </label>
+            <label>
+              <span>结束时间</span>
+              <input id="date-end" type="datetime-local">
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="unknown-date-mode">
+          <legend>未知时间处理</legend>
+          <label class="radio">
+            <input type="radio" name="unknown-date-mode" value="skip" checked>
+            <span>跳过未知时间</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="unknown-date-mode" value="include">
+            <span>包含未知时间</span>
+          </label>
+        </fieldset>
+
         <button id="start" type="submit">扫描并下载</button>
       </form>
 
@@ -78,6 +116,8 @@
         <div class="log-header">
           <h2>诊断日志</h2>
           <div class="log-actions">
+            <button id="export-csv" class="secondary" type="button">导出 CSV</button>
+            <button id="retry-failed" class="secondary" type="button">重试失败项</button>
             <button id="copy-failures" class="secondary" type="button">复制失败清单</button>
             <button id="copy-logs" class="secondary" type="button">复制</button>
             <button id="clear-logs" class="secondary" type="button">清空</button>

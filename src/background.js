@@ -9,6 +9,9 @@ const DOWNLOAD_HISTORY_KEY = "downloadHistory";
 const MAX_LOG_ENTRIES = 300;
 const DEFAULT_SPEED_MODE = "standard";
 const MAX_DOWNLOAD_CONCURRENCY = 3;
+const DEFAULT_DATE_FILTER_MODE = "none";
+const DEFAULT_UNKNOWN_DATE_MODE = "skip";
+const ZIP_EVALUATION_NOTE = "ZIP 仅评估：继续使用浏览器 downloads API 时不强行 ZIP；未来如需 ZIP，必须先 fetch Blob 后用 JSZip 等库打包，并评估大图集中进内存的风险。本版本不会把大图全部加载进内存。";
 const SPEED_PRESETS = {
   stable: { label: "稳定", concurrency: 1, delayMs: 400 },
   standard: { label: "标准", concurrency: 2, delayMs: 100 },
@@ -54,6 +57,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "START_IMAGE_JOB") {
     startImageJob(message.payload)
+      .then((status) => sendResponse({ ok: true, result: status }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message.type === "START_FAILED_ITEMS_RETRY") {
+    startFailedItemsRetryJob(message.payload)
       .then((status) => sendResponse({ ok: true, result: status }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
@@ -124,10 +134,12 @@ async function startImageJob(payload = {}) {
   const startedAt = Date.now();
   const jobId = `${startedAt}-${Math.random().toString(16).slice(2)}`;
   const speed = normalizeSpeedSettings(payload);
+  const dateFilter = normalizeDateFilterSettings(payload.dateFilter, startedAt);
   const settings = {
     folder: sanitizePathSegment(payload.folder || DEFAULT_FOLDER, DEFAULT_FOLDER),
     accountLabel: normalizeAccountLabel(payload.accountLabel),
     downloadMode: normalizeDownloadMode(payload.downloadMode),
+    dateFilter,
     maxScrolls: clamp(numberOrDefault(payload.maxScrolls, 30), 0, 250),
     speedMode: speed.speedMode,
     speedLabel: speed.speedLabel,
@@ -165,6 +177,11 @@ async function startImageJob(payload = {}) {
     submittedDownloads: 0,
     scanListItems: 0,
     skippedItems: 0,
+    dateFilter: settings.dateFilter,
+    filteredIn: 0,
+    filteredOut: 0,
+    unknownDateCount: 0,
+    unknownDateMode: settings.dateFilter.unknownDateMode,
     directResourceSummary: null,
     qualityFailures: 0,
     qualityFailureCount: 0,
@@ -199,6 +216,7 @@ async function startImageJob(payload = {}) {
     deduplicatedItemSamples: [],
     scanList: [],
     skippedItems: [],
+    ...dateFilterReportFields(emptyDateFilterResult(settings.dateFilter)),
     directResourceSummary: null,
     downloadFailures: [],
     skippedDuplicates: [],
@@ -223,11 +241,179 @@ async function startImageJob(payload = {}) {
       folder: settings.folder,
       accountLabel: settings.accountLabel,
       downloadMode: settings.downloadMode,
+      dateFilter: settings.dateFilter,
       runId: settings.runId,
       runFolder: settings.runFolder
     }
   });
+  await appendJobLog({
+    jobId,
+    level: "info",
+    source: "background",
+    stage: "zip-evaluation",
+    message: ZIP_EVALUATION_NOTE
+  });
   runImageJob(jobId, tabId, settings);
+
+  return status;
+}
+
+async function startFailedItemsRetryJob(payload = {}) {
+  const current = await getJobStatus();
+  if (isActiveStatus(current.status)) {
+    return current;
+  }
+
+  const tabId = Number(payload.tabId);
+  if (!tabId) {
+    throw new Error("没有找到可用的 ChatGPT 标签页。");
+  }
+
+  const sourceReport = await readLatestJobReport();
+  if (!sourceReport?.jobId) {
+    throw new Error("当前没有可重试的 jobReport。");
+  }
+
+  const retryOfJobId = String(payload.retryOfJobId || sourceReport.jobId || "");
+  if (retryOfJobId && sourceReport.jobId && retryOfJobId !== sourceReport.jobId) {
+    throw new Error("当前 jobReport 已变化，请重新打开 popup 后再重试。");
+  }
+
+  const retryTargets = buildRetryTargetsFromReport(sourceReport);
+  if (!retryTargets.length) {
+    throw new Error("当前 jobReport 没有解析失败或下载失败项可重试。");
+  }
+
+  const startedAt = Date.now();
+  const jobId = `${startedAt}-${Math.random().toString(16).slice(2)}`;
+  const speed = normalizeSpeedSettings(payload);
+  const dateFilter = normalizeDateFilterSettings(payload.dateFilter || sourceReport.dateFilter, startedAt);
+  const settings = {
+    folder: sanitizePathSegment(payload.folder || DEFAULT_FOLDER, DEFAULT_FOLDER),
+    accountLabel: normalizeAccountLabel(payload.accountLabel),
+    downloadMode: normalizeDownloadMode(payload.downloadMode),
+    dateFilter,
+    maxScrolls: clamp(numberOrDefault(payload.maxScrolls, 30), 0, 250),
+    speedMode: speed.speedMode,
+    speedLabel: speed.speedLabel,
+    downloadConcurrency: speed.concurrency,
+    delayMs: speed.delayMs,
+    startedAt,
+    retryOfJobId
+  };
+  const runContext = buildRunContext({
+    folder: settings.folder,
+    accountLabel: settings.accountLabel,
+    startedAt,
+    jobId
+  });
+  settings.runId = runContext.runId;
+  settings.runFolder = runContext.runFolder;
+
+  const retrySource = createRetrySourceSummary(sourceReport, retryTargets);
+  const status = {
+    id: jobId,
+    runId: runContext.runId,
+    runFolder: runContext.runFolder,
+    retryOfJobId,
+    retryTargetCount: retryTargets.length,
+    status: "running",
+    stage: "retry-scan",
+    message: `正在重试 ${retryTargets.length} 个失败项...`,
+    tabId,
+    scanned: 0,
+    matched: 0,
+    detailFailureCount: 0,
+    scannedItems: 0,
+    resolvedCardItems: 0,
+    resolvedItems: 0,
+    parseFailureCount: 0,
+    deduplicatedItems: 0,
+    current: 0,
+    total: retryTargets.length,
+    downloadStarted: 0,
+    submittedDownloads: 0,
+    scanListItems: 0,
+    skippedItems: 0,
+    dateFilter: settings.dateFilter,
+    filteredIn: 0,
+    filteredOut: 0,
+    unknownDateCount: 0,
+    unknownDateMode: settings.dateFilter.unknownDateMode,
+    directResourceSummary: null,
+    qualityFailures: 0,
+    qualityFailureCount: 0,
+    downloadFailures: 0,
+    downloadFailureCount: 0,
+    skippedDuplicates: 0,
+    skippedDuplicateCount: 0,
+    speedMode: settings.speedMode,
+    speedLabel: settings.speedLabel,
+    downloadConcurrency: settings.downloadConcurrency,
+    delayMs: settings.delayMs,
+    totalDurationMs: 0,
+    downloadDurationMs: 0,
+    startedAt,
+    endedAt: null,
+    settings
+  };
+
+  activeJob = { id: jobId, tabId };
+  await saveJobStatus(status);
+  await saveJobReport(createJobReport({
+    jobId,
+    retryOfJobId,
+    retrySource,
+    retryTargets,
+    runFolder: runContext.runFolder,
+    startedAt,
+    scannedItems: 0,
+    resolvedCardItems: 0,
+    resolvedItems: 0,
+    submittedDownloads: 0,
+    submittedItems: [],
+    parseFailures: [],
+    qualityFailures: [],
+    deduplicatedItems: 0,
+    deduplicatedItemSamples: [],
+    scanList: [],
+    skippedItems: [],
+    ...dateFilterReportFields(emptyDateFilterResult(settings.dateFilter)),
+    directResourceSummary: null,
+    downloadFailures: [],
+    skippedDuplicates: [],
+    speedMode: settings.speedMode,
+    speedLabel: settings.speedLabel,
+    downloadConcurrency: settings.downloadConcurrency,
+    delayMs: settings.delayMs
+  }));
+  await appendJobLog({
+    jobId,
+    level: "info",
+    source: "background",
+    stage: "retry-start",
+    message: "失败项重试任务启动",
+    detail: {
+      tabId,
+      retryOfJobId,
+      retryTargets: retryTargets.length,
+      parseFailures: retrySource.parseFailureCount,
+      downloadFailures: retrySource.downloadFailureCount,
+      qualityFailuresSkipped: retrySource.qualityFailuresSkipped,
+      downloadMode: settings.downloadMode,
+      dateFilter: settings.dateFilter,
+      runId: settings.runId,
+      runFolder: settings.runFolder
+    }
+  });
+  await appendJobLog({
+    jobId,
+    level: "info",
+    source: "background",
+    stage: "zip-evaluation",
+    message: ZIP_EVALUATION_NOTE
+  });
+  runFailedItemsRetryJob(jobId, tabId, settings, sourceReport, retryTargets);
 
   return status;
 }
@@ -239,6 +425,7 @@ async function runImageJob(jobId, tabId, settings) {
   let deduplicatedItems = 0;
   let deduplicatedItemSamples = [];
   let submittedDownloads = 0;
+  let submittedItems = [];
   let parseFailures = [];
   let qualityFailures = [];
   let downloadFailures = [];
@@ -246,6 +433,7 @@ async function runImageJob(jobId, tabId, settings) {
   let scanList = [];
   let skippedItems = [];
   let directResourceSummary = null;
+  let dateFilterResult = emptyDateFilterResult(settings.dateFilter);
 
   try {
     await ensureContentScript(tabId);
@@ -281,6 +469,20 @@ async function runImageJob(jobId, tabId, settings) {
     scanList = normalizeScanListItems(scanResponse.result?.scanList);
     skippedItems = normalizeFailureItems(scanResponse.result?.skippedItems, "skip");
     directResourceSummary = sanitizeReportDiagnostic(scanResponse.result?.directResourceSummary, 3000);
+    dateFilterResult = emptyDateFilterResult(settings.dateFilter);
+    const dateFilteredImages = Array.isArray(images) ? images : [];
+    await appendJobLog({
+      jobId,
+      level: "info",
+      source: "background",
+      stage: "date-filter",
+      message: "date-filter-deferred-until-download-prepare",
+      detail: {
+        dateFilter: dateFilterResult.dateFilter,
+        candidates: dateFilteredImages.length,
+        policy: "unknown DOM dates are fetched first so response-header.last-modified can be used before filtering"
+      }
+    });
     await appendJobLog({
       jobId,
       level: matched ? "info" : "warn",
@@ -296,6 +498,10 @@ async function runImageJob(jobId, tabId, settings) {
         deduplicatedItems,
         scanListItems: scanList.length,
         skippedItems: skippedItems.length,
+        dateFilter: {
+          ...summarizeDateFilterResult(dateFilterResult),
+          deferredUntilDownloadPrepare: true
+        },
         directResources: directResourceSummary
       }
     });
@@ -313,6 +519,7 @@ async function runImageJob(jobId, tabId, settings) {
       qualityFailures,
       scanList,
       skippedItems,
+      ...dateFilterReportFields(dateFilterResult),
       directResourceSummary,
       downloadFailures,
       skippedDuplicates,
@@ -335,21 +542,27 @@ async function runImageJob(jobId, tabId, settings) {
       parseFailureCount: parseFailures.length || Number(detailFailureCount || 0),
       scanListItems: scanList.length,
       skippedItems: skippedItems.length,
+      dateFilter: dateFilterResult.dateFilter,
+      filteredIn: dateFilterResult.filteredIn,
+      filteredOut: dateFilterResult.filteredOut,
+      unknownDateCount: dateFilterResult.unknownDateCount,
+      unknownDateMode: dateFilterResult.dateFilter.unknownDateMode,
       directResourceSummary,
       speedMode: settings.speedMode,
       speedLabel: settings.speedLabel,
       downloadConcurrency: settings.downloadConcurrency,
       delayMs: settings.delayMs,
-      current: matched,
-      total: scanned
+      current: 0,
+      total: matched
     });
 
     const downloadResult = await downloadImages({
       jobId,
       tabId,
-      images,
+      images: dateFilteredImages,
       folder: settings.folder,
       accountLabel: settings.accountLabel,
+      dateFilter: dateFilterResult.dateFilter,
       startedAt: settings.startedAt,
       runId: settings.runId,
       delayMs: settings.delayMs,
@@ -358,6 +571,8 @@ async function runImageJob(jobId, tabId, settings) {
       downloadMode: settings.downloadMode
     });
     submittedDownloads = Number(downloadResult.started || 0);
+    dateFilterResult = downloadResult.dateFilterResult || dateFilterResult;
+    submittedItems = normalizeSubmittedDownloadItems(downloadResult.submittedItems);
     qualityFailures = normalizeFailureItems(downloadResult.qualityFailures, "quality");
     downloadFailures = normalizeFailureItems(downloadResult.failures, "download");
     skippedDuplicates = normalizeSkippedDuplicateItems(downloadResult.skippedDuplicates);
@@ -372,6 +587,7 @@ async function runImageJob(jobId, tabId, settings) {
         qualityFailures: qualityFailures.length,
         failures: downloadFailures.length,
         skippedDuplicates: skippedDuplicates.length,
+        dateFilter: summarizeDateFilterResult(dateFilterResult),
         runId: downloadResult.runId,
         runFolder: downloadResult.runFolder,
         speedMode: downloadResult.speedMode,
@@ -394,10 +610,12 @@ async function runImageJob(jobId, tabId, settings) {
       deduplicatedItems,
       deduplicatedItemSamples,
       submittedDownloads,
+      submittedItems,
       parseFailures,
       qualityFailures,
       scanList,
       skippedItems,
+      ...dateFilterReportFields(dateFilterResult),
       directResourceSummary,
       downloadFailures,
       skippedDuplicates,
@@ -442,6 +660,11 @@ async function runImageJob(jobId, tabId, settings) {
       parseFailureCount: parseFailures.length,
       scanListItems: scanList.length,
       skippedItems: skippedItems.length,
+      dateFilter: dateFilterResult.dateFilter,
+      filteredIn: dateFilterResult.filteredIn,
+      filteredOut: dateFilterResult.filteredOut,
+      unknownDateCount: dateFilterResult.unknownDateCount,
+      unknownDateMode: dateFilterResult.dateFilter.unknownDateMode,
       directResourceSummary,
       qualityFailures: qualityFailures.length,
       qualityFailureCount: qualityFailures.length,
@@ -462,10 +685,12 @@ async function runImageJob(jobId, tabId, settings) {
       deduplicatedItems,
       deduplicatedItemSamples,
       submittedDownloads,
+      submittedItems,
       parseFailures,
       qualityFailures,
       scanList,
       skippedItems,
+      ...dateFilterReportFields(dateFilterResult),
       directResourceSummary,
       downloadFailures,
       skippedDuplicates,
@@ -498,6 +723,344 @@ async function runImageJob(jobId, tabId, settings) {
       parseFailureCount: parseFailures.length,
       scanListItems: scanList.length,
       skippedItems: skippedItems.length,
+      dateFilter: dateFilterResult.dateFilter,
+      filteredIn: dateFilterResult.filteredIn,
+      filteredOut: dateFilterResult.filteredOut,
+      unknownDateCount: dateFilterResult.unknownDateCount,
+      unknownDateMode: dateFilterResult.dateFilter.unknownDateMode,
+      directResourceSummary,
+      submittedDownloads,
+      qualityFailures: qualityFailures.length,
+      qualityFailureCount: qualityFailures.length,
+      downloadFailureCount: downloadFailures.length,
+      downloadFailures: downloadFailures.length,
+      skippedDuplicates: skippedDuplicates.length,
+      skippedDuplicateCount: skippedDuplicates.length,
+      speedMode: settings.speedMode,
+      speedLabel: settings.speedLabel,
+      downloadConcurrency: settings.downloadConcurrency,
+      delayMs: settings.delayMs,
+      totalDurationMs: endedAt - settings.startedAt,
+      endedAt
+    });
+  } finally {
+    if (activeJob?.id === jobId) {
+      activeJob = null;
+    }
+  }
+}
+
+async function runFailedItemsRetryJob(jobId, tabId, settings, sourceReport, retryTargets) {
+  let scannedItems = 0;
+  let resolvedCardItems = 0;
+  let resolvedItems = 0;
+  let deduplicatedItems = 0;
+  let deduplicatedItemSamples = [];
+  let submittedDownloads = 0;
+  let submittedItems = [];
+  let parseFailures = [];
+  let qualityFailures = [];
+  let downloadFailures = [];
+  let skippedDuplicates = [];
+  let scanList = [];
+  let skippedItems = [];
+  let directResourceSummary = null;
+  let dateFilterResult = emptyDateFilterResult(settings.dateFilter);
+  const retryOfJobId = settings.retryOfJobId || sourceReport?.jobId || "";
+  const retrySource = createRetrySourceSummary(sourceReport, retryTargets);
+
+  try {
+    await ensureContentScript(tabId);
+    await appendJobLog({
+      jobId,
+      level: "info",
+      source: "background",
+      stage: "retry-scan",
+      message: "开始重新扫描当前页面以匹配失败项",
+      detail: {
+        retryOfJobId,
+        retryTargets: retryTargets.length,
+        maxScrolls: settings.maxScrolls
+      }
+    });
+
+    const scanResponse = await chrome.tabs.sendMessage(tabId, {
+      type: "SCAN_CHATGPT_IMAGES",
+      payload: {
+        jobId,
+        maxScrolls: settings.maxScrolls,
+        scrollDelayMs: 900,
+        detailOpenTimeoutMs: 5000
+      }
+    });
+
+    if (!scanResponse?.ok) {
+      throw new Error(scanResponse?.error || "失败项重试扫描失败，请刷新 ChatGPT 页面后重试。");
+    }
+
+    const { images, scanned, matched, detailFailureCount } = scanResponse.result;
+    const allParseFailures = normalizeFailureItems(scanResponse.result?.parseFailures, "resolve");
+    scannedItems = Number(scanned || 0);
+    resolvedItems = Number(matched || 0);
+    resolvedCardItems = Number(scanResponse.result?.resolvedCardItems ?? Math.max(scannedItems - allParseFailures.length, resolvedItems));
+    deduplicatedItems = Number(scanResponse.result?.deduplicatedItems ?? Math.max(resolvedCardItems - resolvedItems, 0));
+    deduplicatedItemSamples = normalizeFailureItems(scanResponse.result?.deduplicatedItemSamples, "dedupe");
+    scanList = normalizeScanListItems(scanResponse.result?.scanList);
+    skippedItems = normalizeFailureItems(scanResponse.result?.skippedItems, "skip");
+    directResourceSummary = sanitizeReportDiagnostic(scanResponse.result?.directResourceSummary, 3000);
+
+    const downloadHistory = await readDownloadHistory();
+    const retrySelection = selectRetryImages({
+      images,
+      parseFailures: allParseFailures,
+      retryTargets,
+      retryOfJobId,
+      downloadHistory,
+      downloadMode: settings.downloadMode
+    });
+    parseFailures = normalizeFailureItems(retrySelection.parseFailures, "resolve");
+    skippedDuplicates = normalizeSkippedDuplicateItems(retrySelection.skippedDuplicates);
+    dateFilterResult = emptyDateFilterResult(settings.dateFilter);
+    const dateFilteredImages = Array.isArray(retrySelection.images) ? retrySelection.images : [];
+
+    await appendJobLog({
+      jobId,
+      level: "info",
+      source: "background",
+      stage: "retry-select",
+      message: "失败项重试目标匹配完成",
+      detail: {
+        retryOfJobId,
+        retryTargets: retryTargets.length,
+        matchedImages: retrySelection.images.length,
+        parseFailures: parseFailures.length,
+        preSkippedDuplicates: skippedDuplicates.length,
+        missingTargets: retrySelection.missingTargets.length,
+        dateFilter: {
+          ...summarizeDateFilterResult(dateFilterResult),
+          deferredUntilDownloadPrepare: true,
+          candidates: dateFilteredImages.length
+        }
+      }
+    });
+
+    await saveJobReport(createJobReport({
+      jobId,
+      retryOfJobId,
+      retrySource,
+      retryTargets,
+      runFolder: settings.runFolder,
+      startedAt: settings.startedAt,
+      scannedItems,
+      resolvedCardItems,
+      resolvedItems: retrySelection.images.length,
+      deduplicatedItems,
+      deduplicatedItemSamples,
+      submittedDownloads,
+      submittedItems,
+      parseFailures,
+      qualityFailures,
+      scanList,
+      skippedItems,
+      ...dateFilterReportFields(dateFilterResult),
+      directResourceSummary,
+      downloadFailures,
+      skippedDuplicates,
+      speedMode: settings.speedMode,
+      speedLabel: settings.speedLabel,
+      downloadConcurrency: settings.downloadConcurrency,
+      delayMs: settings.delayMs
+    }));
+    await mergeJobStatus(jobId, {
+      status: "downloading",
+      stage: "retry-downloading",
+      message: `已匹配 ${retrySelection.images.length} 个失败项，正在重试下载...`,
+      scanned: scannedItems,
+      matched: retrySelection.images.length,
+      detailFailureCount: parseFailures.length || Number(detailFailureCount || 0),
+      scannedItems,
+      resolvedCardItems,
+      resolvedItems: retrySelection.images.length,
+      deduplicatedItems,
+      parseFailureCount: parseFailures.length,
+      scanListItems: scanList.length,
+      skippedItems: skippedItems.length,
+      dateFilter: dateFilterResult.dateFilter,
+      filteredIn: dateFilterResult.filteredIn,
+      filteredOut: dateFilterResult.filteredOut,
+      unknownDateCount: dateFilterResult.unknownDateCount,
+      unknownDateMode: dateFilterResult.dateFilter.unknownDateMode,
+      directResourceSummary,
+      speedMode: settings.speedMode,
+      speedLabel: settings.speedLabel,
+      downloadConcurrency: settings.downloadConcurrency,
+      delayMs: settings.delayMs,
+      skippedDuplicates: skippedDuplicates.length,
+      skippedDuplicateCount: skippedDuplicates.length,
+      current: 0,
+      total: retryTargets.length
+    });
+
+    const downloadResult = await downloadImages({
+      jobId,
+      tabId,
+      images: dateFilteredImages,
+      folder: settings.folder,
+      accountLabel: settings.accountLabel,
+      dateFilter: dateFilterResult.dateFilter,
+      startedAt: settings.startedAt,
+      runId: settings.runId,
+      delayMs: settings.delayMs,
+      speedMode: settings.speedMode,
+      downloadConcurrency: settings.downloadConcurrency,
+      downloadMode: settings.downloadMode
+    });
+    submittedDownloads = Number(downloadResult.started || 0);
+    dateFilterResult = downloadResult.dateFilterResult || dateFilterResult;
+    submittedItems = normalizeSubmittedDownloadItems(downloadResult.submittedItems);
+    qualityFailures = normalizeFailureItems(downloadResult.qualityFailures, "quality");
+    downloadFailures = normalizeFailureItems(downloadResult.failures, "download");
+    skippedDuplicates = normalizeSkippedDuplicateItems([
+      ...skippedDuplicates,
+      ...(downloadResult.skippedDuplicates || [])
+    ]);
+
+    const endedAt = Date.now();
+    const report = createJobReport({
+      jobId,
+      retryOfJobId,
+      retrySource,
+      retryTargets,
+      runFolder: downloadResult.runFolder || settings.runFolder,
+      startedAt: settings.startedAt,
+      endedAt,
+      scannedItems,
+      resolvedCardItems,
+      resolvedItems: retrySelection.images.length,
+      deduplicatedItems,
+      deduplicatedItemSamples,
+      submittedDownloads,
+      submittedItems,
+      parseFailures,
+      qualityFailures,
+      scanList,
+      skippedItems,
+      ...dateFilterReportFields(dateFilterResult),
+      directResourceSummary,
+      downloadFailures,
+      skippedDuplicates,
+      speedMode: downloadResult.speedMode || settings.speedMode,
+      speedLabel: downloadResult.speedLabel || settings.speedLabel,
+      downloadConcurrency: downloadResult.concurrency || settings.downloadConcurrency,
+      delayMs: downloadResult.delayMs ?? settings.delayMs,
+      downloadDurationMs: downloadResult.durationMs,
+      downloadStartedAt: downloadResult.startedAt,
+      downloadEndedAt: downloadResult.endedAt
+    });
+    await saveJobReport(report);
+    await appendJobLog({
+      jobId,
+      level: report.parseFailures.length || report.qualityFailures.length || report.downloadFailures.length ? "warn" : "info",
+      source: "background",
+      stage: "retry-report",
+      message: "失败项重试报告已写入 chrome.storage.local",
+      detail: summarizeJobReport(report)
+    });
+
+    await mergeJobStatus(jobId, {
+      status: "done",
+      stage: "done",
+      message: `失败项重试完成，已启动 ${submittedDownloads} 个下载任务。`,
+      downloadStarted: submittedDownloads,
+      submittedDownloads,
+      downloadFailures: downloadFailures.length,
+      downloadFailureCount: downloadFailures.length,
+      skippedDuplicates: skippedDuplicates.length,
+      skippedDuplicateCount: skippedDuplicates.length,
+      speedMode: downloadResult.speedMode || settings.speedMode,
+      speedLabel: downloadResult.speedLabel || settings.speedLabel,
+      downloadConcurrency: downloadResult.concurrency || settings.downloadConcurrency,
+      delayMs: downloadResult.delayMs ?? settings.delayMs,
+      totalDurationMs: endedAt - settings.startedAt,
+      downloadDurationMs: downloadResult.durationMs || 0,
+      scannedItems,
+      resolvedCardItems,
+      resolvedItems: retrySelection.images.length,
+      deduplicatedItems,
+      parseFailureCount: parseFailures.length,
+      scanListItems: scanList.length,
+      skippedItems: skippedItems.length,
+      dateFilter: dateFilterResult.dateFilter,
+      filteredIn: dateFilterResult.filteredIn,
+      filteredOut: dateFilterResult.filteredOut,
+      unknownDateCount: dateFilterResult.unknownDateCount,
+      unknownDateMode: dateFilterResult.dateFilter.unknownDateMode,
+      directResourceSummary,
+      qualityFailures: qualityFailures.length,
+      qualityFailureCount: qualityFailures.length,
+      runId: downloadResult.runId,
+      runFolder: downloadResult.runFolder,
+      endedAt
+    });
+  } catch (error) {
+    const endedAt = Date.now();
+    const report = createJobReport({
+      jobId,
+      retryOfJobId,
+      retrySource,
+      retryTargets,
+      runFolder: settings.runFolder,
+      startedAt: settings.startedAt,
+      endedAt,
+      scannedItems,
+      resolvedCardItems,
+      resolvedItems,
+      deduplicatedItems,
+      deduplicatedItemSamples,
+      submittedDownloads,
+      submittedItems,
+      parseFailures,
+      qualityFailures,
+      scanList,
+      skippedItems,
+      ...dateFilterReportFields(dateFilterResult),
+      directResourceSummary,
+      downloadFailures,
+      skippedDuplicates,
+      speedMode: settings.speedMode,
+      speedLabel: settings.speedLabel,
+      downloadConcurrency: settings.downloadConcurrency,
+      delayMs: settings.delayMs,
+      diagnostic: {
+        reason: error?.message || String(error),
+        stage: "retry-error"
+      }
+    });
+    await saveJobReport(report);
+    await appendJobLog({
+      jobId,
+      level: "error",
+      source: "background",
+      stage: "retry-error",
+      message: error?.message || String(error),
+      detail: summarizeJobReport(report)
+    });
+    await mergeJobStatus(jobId, {
+      status: "error",
+      stage: "retry-error",
+      message: error?.message || String(error),
+      scannedItems,
+      resolvedCardItems,
+      resolvedItems,
+      deduplicatedItems,
+      parseFailureCount: parseFailures.length,
+      scanListItems: scanList.length,
+      skippedItems: skippedItems.length,
+      dateFilter: dateFilterResult.dateFilter,
+      filteredIn: dateFilterResult.filteredIn,
+      filteredOut: dateFilterResult.filteredOut,
+      unknownDateCount: dateFilterResult.unknownDateCount,
+      unknownDateMode: dateFilterResult.dateFilter.unknownDateMode,
       directResourceSummary,
       submittedDownloads,
       qualityFailures: qualityFailures.length,
@@ -615,6 +1178,13 @@ async function cancelImageJob() {
     deduplicatedItemSamples: [],
     scanList: [],
     skippedItems: [],
+    dateFilter: current.dateFilter || current.settings?.dateFilter || normalizeDateFilterSettings(),
+    filteredIn: current.filteredIn ?? 0,
+    filteredOut: current.filteredOut ?? 0,
+    unknownDateCount: current.unknownDateCount ?? 0,
+    timeRangeSkippedItems: [],
+    unknownDateSkippedItems: [],
+    unknownDateIncludedItems: [],
     directResourceSummary: null,
     downloadFailures: [],
     skippedDuplicates: [],
@@ -653,6 +1223,11 @@ async function getJobStatus() {
     submittedDownloads: 0,
     scanListItems: 0,
     skippedItems: 0,
+    dateFilter: normalizeDateFilterSettings(),
+    filteredIn: 0,
+    filteredOut: 0,
+    unknownDateCount: 0,
+    unknownDateMode: DEFAULT_UNKNOWN_DATE_MODE,
     directResourceSummary: null,
     qualityFailures: 0,
     qualityFailureCount: 0,
@@ -696,8 +1271,16 @@ async function saveJobReport(report) {
   return report;
 }
 
+async function readLatestJobReport() {
+  const result = await chrome.storage.local.get([JOB_REPORT_KEY, JOB_MANIFEST_KEY, "imageJobReport"]);
+  return result[JOB_REPORT_KEY] || result.imageJobReport || result[JOB_MANIFEST_KEY] || null;
+}
+
 function createJobReport({
   jobId,
+  retryOfJobId = "",
+  retrySource = null,
+  retryTargets = [],
   runFolder,
   startedAt,
   endedAt = null,
@@ -707,12 +1290,20 @@ function createJobReport({
   deduplicatedItems = 0,
   deduplicatedItemSamples = [],
   submittedDownloads = 0,
+  submittedItems = [],
   parseFailures = [],
   qualityFailures = [],
   downloadFailures = [],
   skippedDuplicates = [],
   scanList = [],
   skippedItems = [],
+  dateFilter = null,
+  filteredIn = 0,
+  filteredOut = 0,
+  unknownDateCount = 0,
+  timeRangeSkippedItems = [],
+  unknownDateSkippedItems = [],
+  unknownDateIncludedItems = [],
   directResourceSummary = null,
   speedMode = DEFAULT_SPEED_MODE,
   speedLabel = "",
@@ -724,6 +1315,10 @@ function createJobReport({
   diagnostic = null
 } = {}) {
   const normalizedSkippedDuplicates = normalizeSkippedDuplicateItems(skippedDuplicates);
+  const normalizedDateFilter = normalizeDateFilterSettings(dateFilter, startedAt);
+  const normalizedTimeRangeSkippedItems = normalizeDateFilterItems(timeRangeSkippedItems, "date-filter");
+  const normalizedUnknownDateSkippedItems = normalizeDateFilterItems(unknownDateSkippedItems, "unknown-date-skip");
+  const normalizedUnknownDateIncludedItems = normalizeDateFilterItems(unknownDateIncludedItems, "unknown-date-include");
   const reportStartedAt = normalizeTimestamp(startedAt) || Date.now();
   const reportEndedAt = endedAt ? normalizeTimestamp(endedAt) || Date.now() : null;
   const speed = normalizeSpeedSettings({
@@ -743,6 +1338,9 @@ function createJobReport({
 
   return {
     jobId: String(jobId || ""),
+    retryOfJobId: String(retryOfJobId || ""),
+    retrySource: sanitizeReportDiagnostic(retrySource, 3000),
+    retryTargets: normalizeRetryTargetsForReport(retryTargets),
     runFolder: String(runFolder || ""),
     startedAt: reportStartedAt,
     endedAt: reportEndedAt,
@@ -762,6 +1360,7 @@ function createJobReport({
     deduplicatedItems: Number(deduplicatedItems) || 0,
     deduplicatedItemSamples: normalizeFailureItems(deduplicatedItemSamples, "dedupe"),
     submittedDownloads: submittedDownloadCount,
+    submittedItems: normalizeSubmittedDownloadItems(submittedItems),
     parseFailures: normalizeFailureItems(parseFailures, "resolve"),
     qualityFailures: normalizeFailureItems(qualityFailures, "quality"),
     downloadFailures: normalizeFailureItems(downloadFailures, "download"),
@@ -769,6 +1368,13 @@ function createJobReport({
     skippedDuplicateCount: normalizedSkippedDuplicates.length,
     scanList: normalizeScanListItems(scanList),
     skippedItems: normalizeFailureItems(skippedItems, "skip"),
+    dateFilter: normalizedDateFilter,
+    filteredIn: Number(filteredIn) || 0,
+    filteredOut: Number(filteredOut) || 0,
+    unknownDateCount: Number(unknownDateCount) || 0,
+    timeRangeSkippedItems: normalizedTimeRangeSkippedItems,
+    unknownDateSkippedItems: normalizedUnknownDateSkippedItems,
+    unknownDateIncludedItems: normalizedUnknownDateIncludedItems,
     directResourceSummary: sanitizeReportDiagnostic(directResourceSummary, 3000),
     diagnostic: sanitizeReportDiagnostic(diagnostic)
   };
@@ -777,6 +1383,8 @@ function createJobReport({
 function summarizeJobReport(report = {}) {
   return {
     jobId: report.jobId || "",
+    retryOfJobId: report.retryOfJobId || "",
+    retryTargets: Array.isArray(report.retryTargets) ? report.retryTargets.length : 0,
     runFolder: report.runFolder || "",
     totalDurationMs: report.totalDurationMs || 0,
     downloadDurationMs: report.downloadDurationMs || 0,
@@ -790,7 +1398,15 @@ function summarizeJobReport(report = {}) {
     resolvedItems: report.resolvedItems || 0,
     deduplicatedItems: report.deduplicatedItems || 0,
     submittedDownloads: report.submittedDownloads || 0,
+    submittedItems: Array.isArray(report.submittedItems) ? report.submittedItems.length : 0,
     skippedDuplicates: Array.isArray(report.skippedDuplicates) ? report.skippedDuplicates.length : 0,
+    dateFilter: report.dateFilter || normalizeDateFilterSettings(),
+    filteredIn: Number(report.filteredIn) || 0,
+    filteredOut: Number(report.filteredOut) || 0,
+    unknownDateCount: Number(report.unknownDateCount) || 0,
+    timeRangeSkippedItems: Array.isArray(report.timeRangeSkippedItems) ? report.timeRangeSkippedItems.length : 0,
+    unknownDateSkippedItems: Array.isArray(report.unknownDateSkippedItems) ? report.unknownDateSkippedItems.length : 0,
+    unknownDateIncludedItems: Array.isArray(report.unknownDateIncludedItems) ? report.unknownDateIncludedItems.length : 0,
     parseFailures: Array.isArray(report.parseFailures) ? report.parseFailures.length : 0,
     qualityFailures: Array.isArray(report.qualityFailures) ? report.qualityFailures.length : 0,
     downloadFailures: Array.isArray(report.downloadFailures) ? report.downloadFailures.length : 0,
@@ -818,6 +1434,8 @@ function normalizeScanListItem(item, fallbackIndex) {
 
   const scanIndex = Number(item.scanIndex || item.index || fallbackIndex || 0);
   const pageOrder = Number(item.pageOrder || scanIndex || fallbackIndex || 0);
+  const dateCandidates = normalizeDateCandidatesForReport(item);
+  const dateInfo = resolveDateWithLastModifiedFallback(item, dateCandidates);
 
   return {
     scanIndex,
@@ -825,7 +1443,10 @@ function normalizeScanListItem(item, fallbackIndex) {
     imageKey: truncateText(item.imageKey || buildReportImageKey(item, scanIndex), 80),
     thumbnailUrl: normalizeFailureUrlSummary(item.thumbnailUrl || item.thumbnail || item.url),
     prompt: truncateText(item.prompt || item.alt || "", 240),
-    date: truncateText(item.date || "", 80),
+    date: truncateText(dateInfo.date, 80),
+    dateSource: truncateText(dateInfo.dateSource, 120),
+    dateCandidates,
+    dateCandidatesSummary: normalizeDateCandidatesSummary(item, dateCandidates),
     position: sanitizeReportDiagnostic(item.position, 1000),
     source: truncateText(item.source || "", 80),
     status: truncateText(item.status || "", 80),
@@ -837,6 +1458,155 @@ function normalizeScanListItem(item, fallbackIndex) {
       ? item.directSources.map((source) => truncateText(source, 80)).slice(0, 20)
       : [],
     directResourceCount: Number(item.directResourceCount || 0)
+  };
+}
+
+function normalizeDateCandidatesForReport(itemOrCandidates) {
+  const candidates = Array.isArray(itemOrCandidates)
+    ? itemOrCandidates
+    : collectDateCandidatesFromReportItem(itemOrCandidates);
+
+  if (!Array.isArray(candidates)) {
+    return [];
+  }
+
+  const seen = new Set();
+  const result = [];
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") {
+      continue;
+    }
+
+    const normalized = {
+      source: truncateText(candidate.source || "", 120),
+      field: truncateText(candidate.field || "", 80),
+      value: truncateText(candidate.value || "", 180),
+      normalizedDate: truncateText(candidate.normalizedDate || "", 80)
+    };
+
+    if (candidate.tag) {
+      normalized.tag = truncateText(candidate.tag, 40);
+    }
+    if (Number.isFinite(candidate.depth)) {
+      normalized.depth = candidate.depth;
+    }
+
+    const key = JSON.stringify(normalized);
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(normalized);
+    if (result.length >= 40) {
+      break;
+    }
+  }
+
+  return result;
+}
+
+function collectDateCandidatesFromReportItem(item = {}) {
+  if (!item || typeof item !== "object") {
+    return [];
+  }
+
+  const diagnostic = item.diagnostic && typeof item.diagnostic === "object" ? item.diagnostic : {};
+  return [
+    ...(Array.isArray(item.dateCandidates) ? item.dateCandidates : []),
+    ...(Array.isArray(diagnostic.dateCandidates) ? diagnostic.dateCandidates : []),
+    ...(Array.isArray(diagnostic.responseDateCandidates) ? diagnostic.responseDateCandidates : []),
+    ...(Array.isArray(diagnostic.fetchFailure?.dateCandidates) ? diagnostic.fetchFailure.dateCandidates : []),
+    ...(Array.isArray(diagnostic.validation?.dateCandidates) ? diagnostic.validation.dateCandidates : []),
+    ...(Array.isArray(diagnostic.diagnostic?.dateCandidates) ? diagnostic.diagnostic.dateCandidates : []),
+    ...(Array.isArray(diagnostic.diagnostic?.fetchFailure?.dateCandidates) ? diagnostic.diagnostic.fetchFailure.dateCandidates : []),
+    ...(Array.isArray(diagnostic.diagnostic?.validation?.dateCandidates) ? diagnostic.diagnostic.validation.dateCandidates : [])
+  ];
+}
+
+function normalizeDateCandidatesSummary(item = {}, dateCandidates = null) {
+  const existing = truncateText(item.dateCandidatesSummary || "", 1000);
+  if (existing) {
+    return existing;
+  }
+
+  return summarizeDateCandidatesForReport(dateCandidates || normalizeDateCandidatesForReport(item));
+}
+
+function summarizeDateCandidatesForReport(candidates, maxEntries = 12) {
+  if (!Array.isArray(candidates) || !candidates.length) {
+    return "";
+  }
+
+  return candidates.slice(0, maxEntries).map((candidate) => {
+    const source = [candidate.source, candidate.field].filter(Boolean).join(":") || "date";
+    const date = candidate.normalizedDate || "?";
+    return `${source}=${date} <= ${truncateText(candidate.value || "", 64)}`;
+  }).join(" | ");
+}
+
+const RESPONSE_LAST_MODIFIED_DATE_SOURCE = "response-header.last-modified";
+
+function resolveDateWithLastModifiedFallback(item = {}, dateCandidates = null) {
+  const existingDate = String(item.date || "");
+  if (existingDate) {
+    return {
+      date: existingDate,
+      dateSource: String(item.dateSource || "")
+    };
+  }
+
+  const fallback = findResponseLastModifiedDateCandidate(dateCandidates || normalizeDateCandidatesForReport(item));
+  return {
+    date: fallback?.normalizedDate || "",
+    dateSource: fallback ? RESPONSE_LAST_MODIFIED_DATE_SOURCE : String(item.dateSource || "")
+  };
+}
+
+function findResponseLastModifiedDateCandidate(candidates) {
+  return (Array.isArray(candidates) ? candidates : [])
+    .find((candidate) => isResponseLastModifiedDateCandidate(candidate)) || null;
+}
+
+function isResponseLastModifiedDateCandidate(candidate = {}) {
+  const source = String(candidate.source || "").toLowerCase();
+  const field = String(candidate.field || "").toLowerCase();
+  return Boolean(candidate.normalizedDate)
+    && (
+      source === RESPONSE_LAST_MODIFIED_DATE_SOURCE
+      || (source === "response-header" && field === "last-modified")
+    );
+}
+
+function collectDateCandidatesFromValues(...values) {
+  const candidates = [];
+
+  for (const value of values) {
+    if (!value) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      candidates.push(...value);
+      continue;
+    }
+    candidates.push(...collectDateCandidatesFromReportItem(value));
+  }
+
+  return normalizeDateCandidatesForReport(candidates);
+}
+
+function applyResponseLastModifiedDateFallback(image = {}, ...candidateSources) {
+  const dateCandidates = collectDateCandidatesFromValues(image, ...candidateSources);
+  const dateInfo = resolveDateWithLastModifiedFallback(image, dateCandidates);
+  const dateCandidatesSummary = summarizeDateCandidatesForReport(dateCandidates) || image.dateCandidatesSummary || "";
+
+  return {
+    ...image,
+    date: dateInfo.date,
+    dateSource: dateInfo.dateSource,
+    dateCandidates,
+    dateCandidatesSummary
   };
 }
 
@@ -860,6 +1630,72 @@ function normalizeSkippedDuplicateItems(items) {
     .filter(Boolean);
 }
 
+function normalizeSubmittedDownloadItems(items) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item, index) => normalizeSubmittedDownloadItem(item, index + 1))
+    .filter(Boolean);
+}
+
+function normalizeSubmittedDownloadItem(item, fallbackIndex) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const index = Number(item.index || item.scanIndex || fallbackIndex || 0);
+  const scanIndex = Number(item.scanIndex || index || fallbackIndex || 0);
+  const pageOrder = Number(item.pageOrder || scanIndex || index || fallbackIndex || 0);
+  const dateCandidates = normalizeDateCandidatesForReport(item);
+  const dateInfo = resolveDateWithLastModifiedFallback(item, dateCandidates);
+
+  return {
+    index,
+    scanIndex,
+    pageOrder,
+    imageKey: truncateText(item.imageKey || buildReportImageKey(item, index), 80),
+    prompt: truncateText(item.prompt || item.alt || "", 240),
+    date: truncateText(dateInfo.date, 80),
+    dateSource: truncateText(dateInfo.dateSource, 120),
+    dateCandidates,
+    dateCandidatesSummary: normalizeDateCandidatesSummary(item, dateCandidates),
+    source: truncateText(item.source || "", 80),
+    sourceUrl: truncateText(item.sourceUrl || item.url || "", 1000),
+    filename: truncateText(item.filename || "", 1000),
+    downloadId: item.downloadId ?? null,
+    reason: truncateText(item.reason || "", 120),
+    stage: truncateText(item.stage || "download", 80),
+    status: truncateText(item.status || "submitted", 80),
+    quality: sanitizeReportDiagnostic(item.quality, 1000),
+    diagnostic: sanitizeReportDiagnostic(item.diagnostic, 1500)
+  };
+}
+
+function normalizeRetryTargetsForReport(items) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item, index) => normalizeRetryTargetForReport(item, index + 1))
+    .filter(Boolean);
+}
+
+function normalizeRetryTargetForReport(item, fallbackIndex) {
+  const normalized = normalizeFailureItem(item, item?.stage || "retry", fallbackIndex);
+  if (!normalized) {
+    return null;
+  }
+
+  return {
+    ...normalized,
+    retrySourceType: truncateText(item.retrySourceType || item.sourceType || "", 40),
+    retryOfJobId: truncateText(item.retryOfJobId || "", 80)
+  };
+}
+
 function normalizeSkippedDuplicateItem(item, fallbackIndex) {
   if (!item || typeof item !== "object") {
     return null;
@@ -868,6 +1704,8 @@ function normalizeSkippedDuplicateItem(item, fallbackIndex) {
   const index = Number(item.index || item.scanIndex || fallbackIndex || 0);
   const scanIndex = Number(item.scanIndex || index || fallbackIndex || 0);
   const pageOrder = Number(item.pageOrder || scanIndex || index || fallbackIndex || 0);
+  const dateCandidates = normalizeDateCandidatesForReport(item);
+  const dateInfo = resolveDateWithLastModifiedFallback(item, dateCandidates);
 
   return {
     index,
@@ -875,13 +1713,54 @@ function normalizeSkippedDuplicateItem(item, fallbackIndex) {
     pageOrder,
     imageKey: truncateText(item.imageKey || buildReportImageKey(item, index), 80),
     prompt: truncateText(item.prompt || item.alt || "", 240),
-    date: truncateText(item.date || "", 80),
+    date: truncateText(dateInfo.date, 80),
+    dateSource: truncateText(dateInfo.dateSource, 120),
+    dateCandidates,
+    dateCandidatesSummary: normalizeDateCandidatesSummary(item, dateCandidates),
     sourceUrl: truncateText(item.sourceUrl || item.url || "", 1000),
     previousFilename: truncateText(item.previousFilename || "", 1000),
     previousDownloadId: item.previousDownloadId ?? null,
     previousSubmittedAt: normalizeTimestamp(item.previousSubmittedAt) || null,
     reason: truncateText(item.reason || "skippedDuplicate", 80),
     stage: truncateText(item.stage || "history-dedupe", 80)
+  };
+}
+
+function normalizeDateFilterItems(items, fallbackReason = "") {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item, index) => normalizeDateFilterItem(item, fallbackReason, index + 1))
+    .filter(Boolean);
+}
+
+function normalizeDateFilterItem(item, fallbackReason = "", fallbackIndex = 0) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const index = Number(item.index || item.scanIndex || fallbackIndex || 0);
+  const scanIndex = Number(item.scanIndex || index || fallbackIndex || 0);
+  const pageOrder = Number(item.pageOrder || scanIndex || index || fallbackIndex || 0);
+  const dateCandidates = normalizeDateCandidatesForReport(item);
+  const dateInfo = resolveDateWithLastModifiedFallback(item, dateCandidates);
+
+  return {
+    index,
+    scanIndex,
+    pageOrder,
+    imageKey: truncateText(item.imageKey || buildReportImageKey(item, index), 80),
+    prompt: truncateText(item.prompt || item.alt || "", 240),
+    date: truncateText(dateInfo.date, 80),
+    dateSource: truncateText(dateInfo.dateSource, 120),
+    dateCandidates,
+    dateCandidatesSummary: normalizeDateCandidatesSummary(item, dateCandidates),
+    source: truncateText(item.source || "", 80),
+    sourceUrl: truncateText(item.sourceUrl || item.url || "", 1000),
+    reason: truncateText(item.reason || fallbackReason || "date-filter", 120),
+    stage: truncateText(item.stage || "date-filter", 80)
   };
 }
 
@@ -899,6 +1778,8 @@ function normalizeFailureItem(item, fallbackStage = "", fallbackIndex = 0) {
   const quality = item.quality !== undefined
     ? item.quality
     : diagnostic?.quality;
+  const dateCandidates = normalizeDateCandidatesForReport(item);
+  const dateInfo = resolveDateWithLastModifiedFallback(item, dateCandidates);
 
   return {
     index,
@@ -907,8 +1788,12 @@ function normalizeFailureItem(item, fallbackStage = "", fallbackIndex = 0) {
     imageKey: truncateText(item.imageKey || buildReportImageKey(item, index), 80),
     thumbnailUrl: normalizeFailureUrlSummary(item.thumbnailUrl || item.thumbnail || item.url),
     prompt: truncateText(item.prompt || item.alt || "", 240),
-    date: truncateText(item.date || "", 80),
+    date: truncateText(dateInfo.date, 80),
+    dateSource: truncateText(dateInfo.dateSource, 120),
+    dateCandidates,
+    dateCandidatesSummary: normalizeDateCandidatesSummary(item, dateCandidates),
     source: truncateText(item.source || "", 80),
+    sourceUrl: truncateText(item.sourceUrl || item.url || "", 1000),
     reason: truncateText(item.reason || item.error || "unknown-failure", 200),
     stage: truncateText(item.stage || fallbackStage || "", 80),
     diagnostic: sanitizeReportDiagnostic(diagnostic),
@@ -927,9 +1812,14 @@ function diagnosticFromFailureItem(item) {
     "imageKey",
     "thumbnailUrl",
     "thumbnail",
+    "sourceUrl",
+    "url",
     "prompt",
     "alt",
     "date",
+    "dateSource",
+    "dateCandidates",
+    "dateCandidatesSummary",
     "source",
     "position",
     "directResourceDisposition",
@@ -972,14 +1862,253 @@ function buildDownloadFailureItem({
     pageOrder: pageOrder || image.pageOrder || image.scanIndex || index,
     imageKey,
     thumbnailUrl: image.thumbnailUrl || image.thumbnail || image.url || "",
+    sourceUrl: image.sourceUrl || image.url || "",
     prompt: image.prompt || image.alt || "",
     date: image.date || "",
+    dateSource: image.dateSource || "",
+    dateCandidates: image.dateCandidates || [],
+    dateCandidatesSummary: image.dateCandidatesSummary || "",
     source: image.source || "",
     reason,
     stage,
     diagnostic,
     quality
   }, stage, index);
+}
+
+function buildRetryTargetsFromReport(report = {}) {
+  const retryOfJobId = String(report.jobId || "");
+  const targets = [];
+
+  appendRetryTargets(targets, report.parseFailures, "parse", retryOfJobId);
+  appendRetryTargets(targets, report.downloadFailures, "download", retryOfJobId);
+
+  const seen = new Set();
+  return targets.filter((target) => {
+    const key = target.imageKey || `${target.retrySourceType}:${target.scanIndex}:${target.reason}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function appendRetryTargets(targets, items, retrySourceType, retryOfJobId) {
+  const normalizedItems = normalizeFailureItems(items, retrySourceType === "parse" ? "resolve" : "download");
+
+  for (const item of normalizedItems) {
+    targets.push({
+      ...item,
+      retrySourceType,
+      retryOfJobId,
+      originalStage: item.stage || "",
+      originalReason: item.reason || ""
+    });
+  }
+}
+
+function createRetrySourceSummary(report = {}, retryTargets = []) {
+  const parseFailureCount = Array.isArray(report.parseFailures) ? report.parseFailures.length : 0;
+  const downloadFailureCount = Array.isArray(report.downloadFailures) ? report.downloadFailures.length : 0;
+  const qualityFailureCount = Array.isArray(report.qualityFailures) ? report.qualityFailures.length : 0;
+
+  return {
+    retryOfJobId: String(report.jobId || ""),
+    sourceRunFolder: String(report.runFolder || ""),
+    sourceStartedAt: report.startedAt || null,
+    sourceEndedAt: report.endedAt || null,
+    parseFailureCount,
+    downloadFailureCount,
+    qualityFailureCount,
+    qualityFailuresSkipped: qualityFailureCount,
+    retryTargetCount: retryTargets.length,
+    retryPolicy: "parseFailures and downloadFailures only; qualityFailures are not retried by default",
+    historyPolicy: "downloadHistory is checked by imageKey; filenames are not used for resume or dedupe"
+  };
+}
+
+function selectRetryImages({
+  images,
+  parseFailures,
+  retryTargets,
+  retryOfJobId,
+  downloadHistory,
+  downloadMode
+} = {}) {
+  const targets = normalizeRetryTargetsForReport(retryTargets);
+  const targetMatches = new Map();
+  const selectedImages = [];
+  const selectedParseFailures = [];
+  const skippedDuplicates = [];
+  const missingTargets = [];
+  const shouldSkipHistory = normalizeDownloadMode(downloadMode) !== "all";
+  const selectedImageKeys = new Set();
+
+  for (const [index, image] of (Array.isArray(images) ? images : []).entries()) {
+    const target = findRetryTargetForItem(image, targets);
+    if (!target) {
+      continue;
+    }
+
+    const imageKey = buildImageKey(image);
+    if (selectedImageKeys.has(imageKey)) {
+      continue;
+    }
+
+    selectedImageKeys.add(imageKey);
+    markRetryTargetMatched(targetMatches, target, "resolved");
+    selectedImages.push({
+      ...image,
+      retryOfJobId,
+      retrySourceType: target.retrySourceType || "",
+      retrySourceImageKey: target.imageKey || "",
+      retrySourceStage: target.stage || "",
+      retrySourceReason: target.reason || "",
+      retrySelectionIndex: index + 1
+    });
+  }
+
+  for (const failure of (Array.isArray(parseFailures) ? parseFailures : [])) {
+    const target = findRetryTargetForItem(failure, targets);
+    if (!target) {
+      continue;
+    }
+
+    markRetryTargetMatched(targetMatches, target, "parse-failed");
+    selectedParseFailures.push(buildRetryFailureItem({
+      target,
+      failure,
+      reason: failure.reason || "retry-parse-failed",
+      stage: failure.stage || "resolve",
+      retryOfJobId
+    }));
+  }
+
+  for (const target of targets) {
+    if (targetMatches.has(retryTargetIdentity(target))) {
+      continue;
+    }
+
+    const previousHistoryEntry = shouldSkipHistory && target.imageKey
+      ? downloadHistory?.[target.imageKey]
+      : null;
+    if (previousHistoryEntry) {
+      skippedDuplicates.push(createSkippedDuplicateItem({
+        index: target.index,
+        scanIndex: target.scanIndex,
+        pageOrder: target.pageOrder,
+        image: target,
+        imageKey: target.imageKey,
+        previous: previousHistoryEntry
+      }));
+      markRetryTargetMatched(targetMatches, target, "history");
+      continue;
+    }
+
+    missingTargets.push(target);
+    selectedParseFailures.push(buildRetryFailureItem({
+      target,
+      reason: "retry-target-not-resolved-in-current-scan",
+      stage: "retry-select",
+      retryOfJobId
+    }));
+  }
+
+  return {
+    images: selectedImages,
+    parseFailures: selectedParseFailures,
+    skippedDuplicates,
+    missingTargets
+  };
+}
+
+function findRetryTargetForItem(item, retryTargets) {
+  const keys = retryMatchKeys(item);
+  for (const target of retryTargets) {
+    if (keys.has(target.imageKey)) {
+      return target;
+    }
+  }
+
+  return retryTargets.find((target) => isLikelySameRetryItem(item, target)) || null;
+}
+
+function retryMatchKeys(item = {}) {
+  const keys = new Set();
+  for (const key of [
+    item.imageKey,
+    item.retrySourceImageKey,
+    item.initialImageKey,
+    item.previousImageKey,
+    ...(Array.isArray(item.retryImageKeys) ? item.retryImageKeys : [])
+  ]) {
+    const normalized = sanitizeProvidedImageKey(key);
+    if (normalized) {
+      keys.add(normalized);
+    }
+  }
+
+  const builtKey = buildImageKey(item);
+  if (builtKey) {
+    keys.add(builtKey);
+  }
+
+  return keys;
+}
+
+function isLikelySameRetryItem(item = {}, target = {}) {
+  const itemScanIndex = Number(item.scanIndex || item.index || 0);
+  const targetScanIndex = Number(target.scanIndex || target.index || 0);
+  if (!itemScanIndex || !targetScanIndex || itemScanIndex !== targetScanIndex) {
+    return false;
+  }
+
+  const itemDate = normalizeKeyText(item.date || "");
+  const targetDate = normalizeKeyText(target.date || "");
+  if (itemDate && targetDate && itemDate !== targetDate) {
+    return false;
+  }
+
+  const itemPrompt = normalizeKeyText(item.prompt || item.alt || "").slice(0, 80);
+  const targetPrompt = normalizeKeyText(target.prompt || target.alt || "").slice(0, 80);
+  return !itemPrompt || !targetPrompt || itemPrompt === targetPrompt;
+}
+
+function markRetryTargetMatched(targetMatches, target, value) {
+  targetMatches.set(retryTargetIdentity(target), value);
+}
+
+function retryTargetIdentity(target = {}) {
+  return target.imageKey || `${target.retrySourceType || "retry"}:${target.scanIndex || target.index || 0}:${target.reason || ""}`;
+}
+
+function buildRetryFailureItem({ target = {}, failure = null, reason = "", stage = "retry-select", retryOfJobId = "" } = {}) {
+  return normalizeFailureItem({
+    index: failure?.index || target.index,
+    scanIndex: failure?.scanIndex || target.scanIndex,
+    pageOrder: failure?.pageOrder || target.pageOrder,
+    imageKey: failure?.imageKey || target.imageKey,
+    thumbnailUrl: failure?.thumbnailUrl || target.thumbnailUrl,
+    prompt: failure?.prompt || target.prompt || "",
+    date: failure?.date || target.date || "",
+    dateSource: failure?.dateSource || target.dateSource || "",
+    dateCandidates: failure?.dateCandidates || target.dateCandidates || [],
+    dateCandidatesSummary: failure?.dateCandidatesSummary || target.dateCandidatesSummary || "",
+    source: failure?.source || target.source || "",
+    sourceUrl: failure?.sourceUrl || target.sourceUrl || "",
+    reason,
+    stage,
+    diagnostic: {
+      retryOfJobId,
+      retrySourceType: target.retrySourceType || "",
+      retrySourceImageKey: target.imageKey || "",
+      retrySourceStage: target.originalStage || target.stage || "",
+      retrySourceReason: target.originalReason || target.reason || "",
+      failureDiagnostic: failure?.diagnostic || null
+    },
+    quality: failure?.quality || target.quality || null
+  }, stage, target.index);
 }
 
 function normalizeFailureUrlSummary(value) {
@@ -1122,12 +2251,15 @@ function isActiveStatus(status) {
 }
 
 async function downloadImages(payload) {
-  const images = Array.isArray(payload?.images) ? payload.images : [];
+  const rawImages = Array.isArray(payload?.images) ? payload.images : [];
   const folder = sanitizePathSegment(payload?.folder || DEFAULT_FOLDER, DEFAULT_FOLDER);
   const accountLabel = normalizeAccountLabel(payload?.accountLabel);
   const startedAt = normalizeTimestamp(payload?.startedAt) || Date.now();
   const jobId = payload?.jobId || "";
   const speed = normalizeSpeedSettings(payload);
+  const dateFilter = normalizeDateFilterSettings(payload?.dateFilter, startedAt);
+  const images = rawImages;
+  const dateFilterAccumulator = createDownloadDateFilterAccumulator(dateFilter);
   const runContext = buildRunContext({
     folder,
     accountLabel,
@@ -1148,6 +2280,7 @@ async function downloadImages(payload) {
   const failures = [];
   const qualityFailures = [];
   const skippedDuplicates = [];
+  const submittedItems = [];
 
   await appendJobLog({
     jobId,
@@ -1162,6 +2295,10 @@ async function downloadImages(payload) {
       runFolder,
       total: images.length,
       downloadMode,
+      dateFilter: {
+        ...summarizeDateFilterResult(dateFilterAccumulator),
+        timing: "after-download-prepare"
+      },
       historyItems: Object.keys(downloadHistory).length,
       speedMode: speed.speedMode,
       speedLabel: speed.speedLabel,
@@ -1183,6 +2320,7 @@ async function downloadImages(payload) {
       jobId,
       shouldSkipHistory,
       downloadHistory,
+      dateFilter,
       runContext,
       runId,
       runFolder
@@ -1195,6 +2333,8 @@ async function downloadImages(payload) {
     failures.push(...(result.failures || []));
     qualityFailures.push(...(result.qualityFailures || []));
     skippedDuplicates.push(...(result.skippedDuplicates || []));
+    submittedItems.push(...(result.submittedItems || []));
+    accumulateDownloadDateFilterResult(dateFilterAccumulator, result);
 
     if (result.historyEntry && result.imageKey) {
       downloadHistory[result.imageKey] = result.historyEntry;
@@ -1207,14 +2347,20 @@ async function downloadImages(payload) {
 
   const downloadEndedAt = Date.now();
   const durationMs = Math.max(downloadEndedAt - downloadStartedAt, 0);
+  const dateFilterResult = finalizeDownloadDateFilterResult(dateFilterAccumulator);
 
   return {
     started,
     failures,
     submittedDownloads: started,
+    submittedItems,
     qualityFailures,
     downloadFailures: failures,
     skippedDuplicates,
+    dateFilterResult,
+    timeRangeSkippedItems: dateFilterResult.timeRangeSkippedItems,
+    unknownDateSkippedItems: dateFilterResult.unknownDateSkippedItems,
+    unknownDateIncludedItems: dateFilterResult.unknownDateIncludedItems,
     runId,
     runFolder,
     accountLabel,
@@ -1260,6 +2406,7 @@ async function processDownloadImageItem({
   jobId,
   shouldSkipHistory,
   downloadHistory,
+  dateFilter,
   runContext,
   runId,
   runFolder
@@ -1270,6 +2417,12 @@ async function processDownloadImageItem({
     failures: [],
     qualityFailures: [],
     skippedDuplicates: [],
+    submittedItems: [],
+    dateFilterIncluded: 0,
+    unknownDateCount: 0,
+    timeRangeSkippedItems: [],
+    unknownDateSkippedItems: [],
+    unknownDateIncludedItems: [],
     imageKey: "",
     historyEntry: null
   };
@@ -1296,6 +2449,7 @@ async function processDownloadImageItem({
       previous: previousHistoryEntry
     });
     result.skippedDuplicates.push(skippedDuplicate);
+    result.dateFilterIncluded = 1;
     await appendJobLog({
       jobId,
       level: "info",
@@ -1348,13 +2502,50 @@ async function processDownloadImageItem({
       index: itemNumber,
       total
     });
+    const targetDateCandidates = collectDateCandidatesFromValues(target);
+    const imageWithDateFallback = applyResponseLastModifiedDateFallback(image, targetDateCandidates);
+    const dateFilterDecision = evaluatePreparedImageDateFilter({
+      image: imageWithDateFallback,
+      dateFilter,
+      index: itemNumber
+    });
+    applyPreparedImageDateFilterDecision(result, dateFilterDecision);
+
+    if (dateFilterDecision.action !== "include") {
+      await appendJobLog({
+        jobId,
+        level: "info",
+        source: "background",
+        stage: "date-filter",
+        message: dateFilterDecision.action === "skip-time-range"
+          ? "date-filter-skip: prepared image is outside selected range"
+          : "date-filter-skip: prepared image date is still unknown",
+        detail: {
+          index: itemNumber,
+          scanIndex,
+          pageOrder,
+          total,
+          imageKey,
+          shortHash,
+          source: image.source || "",
+          runFolder,
+          date: imageWithDateFallback.date || "",
+          dateSource: imageWithDateFallback.dateSource || "",
+          reason: dateFilterDecision.reason,
+          dateFilter: dateFilterDecision.dateFilter,
+          dateCandidatesSummary: imageWithDateFallback.dateCandidatesSummary || ""
+        }
+      });
+
+      return result;
+    }
 
     if (!target.ok) {
       const failureItem = buildDownloadFailureItem({
         index: itemNumber,
         scanIndex,
         pageOrder,
-        image,
+        image: imageWithDateFallback,
         imageKey,
         reason: target.reason,
         stage: isQualityFailureResult(target) ? "quality-check" : "download-prepare",
@@ -1421,14 +2612,14 @@ async function processDownloadImageItem({
     });
 
     const extension = sanitizeFileExtension(
-      target.extension || extensionFromMimeType(target.mimeType) || guessExtension(image.url)
+      target.extension || extensionFromMimeType(target.mimeType) || guessExtension(imageWithDateFallback.url)
     );
-    const baseName = buildBaseName(image, itemNumber, shortHash, runContext.dateSegment);
+    const baseName = buildBaseName(imageWithDateFallback, itemNumber, shortHash, runContext.dateSegment);
     const filename = `${runFolder}/${baseName}.${extension}`;
     const submitted = await submitImageDownload({
       tabId,
       jobId,
-      image,
+      image: imageWithDateFallback,
       target,
       filename,
       imageKey,
@@ -1443,7 +2634,7 @@ async function processDownloadImageItem({
         index: itemNumber,
         scanIndex,
         pageOrder,
-        image,
+        image: imageWithDateFallback,
         imageKey,
         reason: submitted.reason,
         stage: "download-submit",
@@ -1481,12 +2672,25 @@ async function processDownloadImageItem({
     }
 
     result.started = 1;
-    result.historyEntry = createDownloadHistoryEntry({
-      image,
+    result.submittedItems.push(createSubmittedDownloadItem({
+      index: itemNumber,
+      scanIndex,
+      pageOrder,
+      image: imageWithDateFallback,
       imageKey,
       filename,
       downloadId: submitted.downloadId,
-      sourceUrl: target.sourceUrl || image.sourceUrl || image.url || "",
+      sourceUrl: target.sourceUrl || imageWithDateFallback.sourceUrl || imageWithDateFallback.url || "",
+      quality: target.quality || null,
+      diagnostic: target.diagnostic || null,
+      dateCandidates: targetDateCandidates
+    }));
+    result.historyEntry = createDownloadHistoryEntry({
+      image: imageWithDateFallback,
+      imageKey,
+      filename,
+      downloadId: submitted.downloadId,
+      sourceUrl: target.sourceUrl || imageWithDateFallback.sourceUrl || imageWithDateFallback.url || "",
       submittedAt: Date.now()
     });
     await appendJobLog({
@@ -1627,6 +2831,7 @@ function normalizeDownloadHistoryEntry(item) {
     filename: String(item.filename || ""),
     downloadId: item.downloadId ?? null,
     date: String(item.date || ""),
+    dateSource: String(item.dateSource || ""),
     prompt: String(item.prompt || ""),
     sourceUrl: String(item.sourceUrl || ""),
     submittedAt: normalizeTimestamp(item.submittedAt) || Date.now(),
@@ -1635,15 +2840,45 @@ function normalizeDownloadHistoryEntry(item) {
 }
 
 function createDownloadHistoryEntry({ image = {}, imageKey = "", filename = "", downloadId = null, sourceUrl = "", submittedAt = Date.now() } = {}) {
+  const dateInfo = resolveDateWithLastModifiedFallback(image);
   return normalizeDownloadHistoryEntry({
     imageKey,
     filename,
     downloadId,
-    date: image.date || "",
+    date: dateInfo.date,
+    dateSource: dateInfo.dateSource,
     prompt: image.prompt || image.alt || "",
     sourceUrl,
     submittedAt
   });
+}
+
+function createSubmittedDownloadItem({ index, scanIndex, pageOrder, image = {}, imageKey = "", filename = "", downloadId = null, sourceUrl = "", quality = null, diagnostic = null, dateCandidates = [] } = {}) {
+  const mergedDateCandidates = [
+    ...(Array.isArray(image.dateCandidates) ? image.dateCandidates : []),
+    ...(Array.isArray(dateCandidates) ? dateCandidates : [])
+  ];
+  const mergedDateCandidatesSummary = summarizeDateCandidatesForReport(normalizeDateCandidatesForReport(mergedDateCandidates));
+  return normalizeSubmittedDownloadItem({
+    index,
+    scanIndex,
+    pageOrder,
+    imageKey,
+    prompt: image.prompt || image.alt || "",
+    date: image.date || "",
+    dateSource: image.dateSource || "",
+    dateCandidates: mergedDateCandidates,
+    dateCandidatesSummary: mergedDateCandidatesSummary || image.dateCandidatesSummary || "",
+    source: image.source || "",
+    sourceUrl,
+    filename,
+    downloadId,
+    stage: "download",
+    status: "submitted",
+    reason: "",
+    quality,
+    diagnostic
+  }, index);
 }
 
 function createSkippedDuplicateItem({ index, scanIndex, pageOrder, image = {}, imageKey = "", previous = {} } = {}) {
@@ -1654,6 +2889,9 @@ function createSkippedDuplicateItem({ index, scanIndex, pageOrder, image = {}, i
     imageKey,
     prompt: image.prompt || image.alt || "",
     date: image.date || "",
+    dateSource: image.dateSource || "",
+    dateCandidates: image.dateCandidates || [],
+    dateCandidatesSummary: image.dateCandidatesSummary || "",
     sourceUrl: image.sourceUrl || image.url || "",
     previousFilename: previous.filename || "",
     previousDownloadId: previous.downloadId ?? null,
@@ -2219,6 +3457,339 @@ function normalizeAccountLabel(value) {
   return sanitizePathSegment(value || DEFAULT_ACCOUNT_LABEL, DEFAULT_ACCOUNT_LABEL).slice(0, 80) || DEFAULT_ACCOUNT_LABEL;
 }
 
+function normalizeDateFilterSettings(value = {}, now = Date.now()) {
+  const source = value && typeof value === "object" ? value : {};
+  const rawMode = String(source.mode || source.dateFilterMode || DEFAULT_DATE_FILTER_MODE).toLowerCase();
+  const mode = rawMode === "today" || rawMode === "custom" ? rawMode : DEFAULT_DATE_FILTER_MODE;
+  const unknownDateMode = normalizeUnknownDateMode(source.unknownDateMode || source.unknownDates || source.includeUnknownDates);
+  const timestamp = normalizeTimestamp(now) || Date.now();
+  let start = null;
+  let end = null;
+
+  if (mode === "today") {
+    const today = new Date(timestamp);
+    start = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0, 0).getTime();
+    end = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999).getTime();
+  } else if (mode === "custom") {
+    start = parseDateFilterBoundary(source.start || source.startDate || source.customStart, "start");
+    end = parseDateFilterBoundary(source.end || source.endDate || source.customEnd, "end");
+  }
+
+  if (start !== null && end !== null && start > end) {
+    const previousStart = start;
+    start = end;
+    end = previousStart;
+  }
+
+  return {
+    mode,
+    unknownDateMode,
+    start,
+    end,
+    startIso: start !== null ? new Date(start).toISOString() : "",
+    endIso: end !== null ? new Date(end).toISOString() : "",
+    startLocal: start !== null ? formatLocalDateTime(start) : "",
+    endLocal: end !== null ? formatLocalDateTime(end) : "",
+    timezoneOffsetMinutes: new Date(timestamp).getTimezoneOffset()
+  };
+}
+
+function normalizeUnknownDateMode(value) {
+  if (value === true) {
+    return "include";
+  }
+  if (value === false) {
+    return "skip";
+  }
+
+  return String(value || DEFAULT_UNKNOWN_DATE_MODE).toLowerCase() === "include"
+    ? "include"
+    : DEFAULT_UNKNOWN_DATE_MODE;
+}
+
+function parseDateFilterBoundary(value, boundary = "start") {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric;
+  }
+
+  const text = String(value || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const dateOnly = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (dateOnly) {
+    const year = Number(dateOnly[1]);
+    const month = Number(dateOnly[2]) - 1;
+    const day = Number(dateOnly[3]);
+    const date = boundary === "end"
+      ? new Date(year, month, day, 23, 59, 59, 999)
+      : new Date(year, month, day, 0, 0, 0, 0);
+    const timestamp = date.getTime();
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+
+  const localDateTime = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[T\s](\d{1,2})(?::(\d{1,2}))?(?::(\d{1,2}))?$/);
+  if (localDateTime) {
+    const hasSeconds = localDateTime[6] !== undefined;
+    const date = new Date(
+      Number(localDateTime[1]),
+      Number(localDateTime[2]) - 1,
+      Number(localDateTime[3]),
+      Number(localDateTime[4]),
+      Number(localDateTime[5] || 0),
+      hasSeconds ? Number(localDateTime[6]) : (boundary === "end" ? 59 : 0),
+      boundary === "end" ? 999 : 0
+    );
+    const timestamp = date.getTime();
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function emptyDateFilterResult(dateFilter) {
+  const normalizedDateFilter = normalizeDateFilterSettings(dateFilter);
+  return {
+    images: [],
+    dateFilter: normalizedDateFilter,
+    filteredIn: 0,
+    filteredOut: 0,
+    unknownDateCount: 0,
+    timeRangeSkippedItems: [],
+    unknownDateSkippedItems: [],
+    unknownDateIncludedItems: []
+  };
+}
+
+function createDownloadDateFilterAccumulator(dateFilter) {
+  return emptyDateFilterResult(dateFilter);
+}
+
+function accumulateDownloadDateFilterResult(accumulator, result = {}) {
+  if (!accumulator || typeof accumulator !== "object") {
+    return;
+  }
+
+  accumulator.filteredIn += Number(result.dateFilterIncluded || 0) || 0;
+  accumulator.unknownDateCount += Number(result.unknownDateCount || 0) || 0;
+  accumulator.timeRangeSkippedItems.push(...(Array.isArray(result.timeRangeSkippedItems) ? result.timeRangeSkippedItems : []));
+  accumulator.unknownDateSkippedItems.push(...(Array.isArray(result.unknownDateSkippedItems) ? result.unknownDateSkippedItems : []));
+  accumulator.unknownDateIncludedItems.push(...(Array.isArray(result.unknownDateIncludedItems) ? result.unknownDateIncludedItems : []));
+  accumulator.filteredOut = accumulator.timeRangeSkippedItems.length + accumulator.unknownDateSkippedItems.length;
+}
+
+function finalizeDownloadDateFilterResult(accumulator) {
+  const result = accumulator && typeof accumulator === "object"
+    ? accumulator
+    : emptyDateFilterResult();
+
+  return {
+    ...result,
+    filteredIn: Number(result.filteredIn) || 0,
+    filteredOut: (Array.isArray(result.timeRangeSkippedItems) ? result.timeRangeSkippedItems.length : 0)
+      + (Array.isArray(result.unknownDateSkippedItems) ? result.unknownDateSkippedItems.length : 0),
+    unknownDateCount: Number(result.unknownDateCount) || 0,
+    timeRangeSkippedItems: Array.isArray(result.timeRangeSkippedItems) ? result.timeRangeSkippedItems : [],
+    unknownDateSkippedItems: Array.isArray(result.unknownDateSkippedItems) ? result.unknownDateSkippedItems : [],
+    unknownDateIncludedItems: Array.isArray(result.unknownDateIncludedItems) ? result.unknownDateIncludedItems : []
+  };
+}
+
+function evaluatePreparedImageDateFilter({ image = {}, dateFilter, index = 0 } = {}) {
+  const normalizedDateFilter = normalizeDateFilterSettings(dateFilter);
+  const imageTimestamp = parseImageDateTimestamp(image?.date);
+
+  if (imageTimestamp === null) {
+    const shouldSkipUnknown = normalizedDateFilter.mode !== DEFAULT_DATE_FILTER_MODE
+      && normalizedDateFilter.unknownDateMode === "skip";
+    const item = createDateFilterItem({
+      image,
+      index,
+      reason: shouldSkipUnknown ? "unknown-date-skipped" : "unknown-date-included"
+    });
+
+    return {
+      action: shouldSkipUnknown ? "skip-unknown" : "include",
+      reason: shouldSkipUnknown ? "unknown-date-skipped" : "unknown-date-included",
+      dateFilter: normalizedDateFilter,
+      dateFilterIncluded: shouldSkipUnknown ? 0 : 1,
+      unknownDateCount: 1,
+      unknownDateSkippedItem: shouldSkipUnknown ? item : null,
+      unknownDateIncludedItem: shouldSkipUnknown ? null : item
+    };
+  }
+
+  if (isImageTimestampInDateFilter(imageTimestamp, normalizedDateFilter)) {
+    return {
+      action: "include",
+      reason: "inside-date-range",
+      dateFilter: normalizedDateFilter,
+      dateFilterIncluded: 1,
+      unknownDateCount: 0
+    };
+  }
+
+  return {
+    action: "skip-time-range",
+    reason: "outside-date-range",
+    dateFilter: normalizedDateFilter,
+    dateFilterIncluded: 0,
+    unknownDateCount: 0,
+    timeRangeSkippedItem: createDateFilterItem({
+      image,
+      index,
+      reason: "outside-date-range"
+    })
+  };
+}
+
+function applyPreparedImageDateFilterDecision(result, decision = {}) {
+  if (!result || typeof result !== "object") {
+    return;
+  }
+
+  result.dateFilterIncluded += Number(decision.dateFilterIncluded || 0) || 0;
+  result.unknownDateCount += Number(decision.unknownDateCount || 0) || 0;
+
+  if (decision.timeRangeSkippedItem) {
+    result.timeRangeSkippedItems.push(decision.timeRangeSkippedItem);
+  }
+  if (decision.unknownDateSkippedItem) {
+    result.unknownDateSkippedItems.push(decision.unknownDateSkippedItem);
+  }
+  if (decision.unknownDateIncludedItem) {
+    result.unknownDateIncludedItems.push(decision.unknownDateIncludedItem);
+  }
+}
+
+function filterImagesByDate(images, dateFilter) {
+  const normalizedDateFilter = normalizeDateFilterSettings(dateFilter);
+  const filteredImages = [];
+  const timeRangeSkippedItems = [];
+  const unknownDateSkippedItems = [];
+  const unknownDateIncludedItems = [];
+  const list = Array.isArray(images) ? images : [];
+  let unknownDateCount = 0;
+
+  for (const [index, image] of list.entries()) {
+    const itemNumber = index + 1;
+    const imageWithDateFallback = applyResponseLastModifiedDateFallback(image);
+    const decision = evaluatePreparedImageDateFilter({
+      image: imageWithDateFallback,
+      dateFilter: normalizedDateFilter,
+      index: itemNumber
+    });
+
+    unknownDateCount += Number(decision.unknownDateCount || 0) || 0;
+
+    if (decision.action === "include") {
+      if (decision.unknownDateIncludedItem) {
+        unknownDateIncludedItems.push(decision.unknownDateIncludedItem);
+      }
+      filteredImages.push(imageWithDateFallback);
+      continue;
+    }
+
+    if (decision.action === "skip-time-range" && decision.timeRangeSkippedItem) {
+      timeRangeSkippedItems.push(decision.timeRangeSkippedItem);
+      continue;
+    }
+
+    if (decision.action === "skip-unknown" && decision.unknownDateSkippedItem) {
+      unknownDateSkippedItems.push(decision.unknownDateSkippedItem);
+    }
+  }
+
+  return {
+    images: filteredImages,
+    dateFilter: normalizedDateFilter,
+    filteredIn: filteredImages.length,
+    filteredOut: Math.max(list.length - filteredImages.length, 0),
+    unknownDateCount,
+    timeRangeSkippedItems,
+    unknownDateSkippedItems,
+    unknownDateIncludedItems
+  };
+}
+
+function parseImageDateTimestamp(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const dateOnly = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (dateOnly) {
+    const timestamp = new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3])).getTime();
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isImageTimestampInDateFilter(timestamp, dateFilter) {
+  if (dateFilter.mode === DEFAULT_DATE_FILTER_MODE) {
+    return true;
+  }
+  if (dateFilter.start !== null && timestamp < dateFilter.start) {
+    return false;
+  }
+  if (dateFilter.end !== null && timestamp > dateFilter.end) {
+    return false;
+  }
+
+  return true;
+}
+
+function createDateFilterItem({ image = {}, index = 0, reason = "date-filter" } = {}) {
+  const scanIndex = normalizedScanIndex(image, index);
+  return normalizeDateFilterItem({
+    index,
+    scanIndex,
+    pageOrder: Number(image.pageOrder || scanIndex || index || 0),
+    imageKey: image.imageKey || buildImageKey(image),
+    prompt: image.prompt || image.alt || "",
+    date: image.date || "",
+    dateSource: image.dateSource || "",
+    dateCandidates: image.dateCandidates || [],
+    dateCandidatesSummary: image.dateCandidatesSummary || "",
+    source: image.source || "",
+    sourceUrl: image.sourceUrl || image.url || "",
+    reason,
+    stage: "date-filter"
+  }, reason, index);
+}
+
+function dateFilterReportFields(result) {
+  const value = result && typeof result === "object" ? result : emptyDateFilterResult();
+  return {
+    dateFilter: value.dateFilter || normalizeDateFilterSettings(),
+    filteredIn: Number(value.filteredIn) || 0,
+    filteredOut: Number(value.filteredOut) || 0,
+    unknownDateCount: Number(value.unknownDateCount) || 0,
+    timeRangeSkippedItems: normalizeDateFilterItems(value.timeRangeSkippedItems, "outside-date-range"),
+    unknownDateSkippedItems: normalizeDateFilterItems(value.unknownDateSkippedItems, "unknown-date-skipped"),
+    unknownDateIncludedItems: normalizeDateFilterItems(value.unknownDateIncludedItems, "unknown-date-included")
+  };
+}
+
+function summarizeDateFilterResult(result) {
+  const fields = dateFilterReportFields(result);
+  return {
+    dateFilter: fields.dateFilter,
+    filteredIn: fields.filteredIn,
+    filteredOut: fields.filteredOut,
+    unknownDateCount: fields.unknownDateCount,
+    timeRangeSkipped: fields.timeRangeSkippedItems.length,
+    unknownDateSkipped: fields.unknownDateSkippedItems.length,
+    unknownDateIncluded: fields.unknownDateIncludedItems.length
+  };
+}
+
 function normalizeDownloadMode(value) {
   return String(value || "").toLowerCase() === "all" ? "all" : "new";
 }
@@ -2286,6 +3857,11 @@ function formatLocalDate(timestamp) {
     padNumber(date.getMonth() + 1),
     padNumber(date.getDate())
   ].join("-");
+}
+
+function formatLocalDateTime(timestamp) {
+  const date = new Date(timestamp);
+  return `${formatLocalDate(timestamp)} ${padNumber(date.getHours())}:${padNumber(date.getMinutes())}:${padNumber(date.getSeconds())}`;
 }
 
 function formatCompactTimestamp(timestamp) {
