@@ -7,6 +7,13 @@ const JOB_REPORT_KEY = "jobReport";
 const JOB_MANIFEST_KEY = "jobManifest";
 const DOWNLOAD_HISTORY_KEY = "downloadHistory";
 const MAX_LOG_ENTRIES = 300;
+const DEFAULT_SPEED_MODE = "standard";
+const MAX_DOWNLOAD_CONCURRENCY = 3;
+const SPEED_PRESETS = {
+  stable: { label: "稳定", concurrency: 1, delayMs: 400 },
+  standard: { label: "标准", concurrency: 2, delayMs: 100 },
+  fast: { label: "快速", concurrency: 3, delayMs: 0 }
+};
 const IMAGE_URL_RE = /\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#].*)?$/i;
 const ESTUARY_CONTENT_PATHS = new Set([
   "/api/estuary/content",
@@ -116,12 +123,16 @@ async function startImageJob(payload = {}) {
 
   const startedAt = Date.now();
   const jobId = `${startedAt}-${Math.random().toString(16).slice(2)}`;
+  const speed = normalizeSpeedSettings(payload);
   const settings = {
     folder: sanitizePathSegment(payload.folder || DEFAULT_FOLDER, DEFAULT_FOLDER),
     accountLabel: normalizeAccountLabel(payload.accountLabel),
     downloadMode: normalizeDownloadMode(payload.downloadMode),
     maxScrolls: clamp(numberOrDefault(payload.maxScrolls, 30), 0, 250),
-    delayMs: clamp(numberOrDefault(payload.delayMs, 400), 0, 5000),
+    speedMode: speed.speedMode,
+    speedLabel: speed.speedLabel,
+    downloadConcurrency: speed.concurrency,
+    delayMs: speed.delayMs,
     startedAt
   };
   const runContext = buildRunContext({
@@ -161,6 +172,12 @@ async function startImageJob(payload = {}) {
     downloadFailureCount: 0,
     skippedDuplicates: 0,
     skippedDuplicateCount: 0,
+    speedMode: settings.speedMode,
+    speedLabel: settings.speedLabel,
+    downloadConcurrency: settings.downloadConcurrency,
+    delayMs: settings.delayMs,
+    totalDurationMs: 0,
+    downloadDurationMs: 0,
     startedAt,
     endedAt: null,
     settings
@@ -184,7 +201,11 @@ async function startImageJob(payload = {}) {
     skippedItems: [],
     directResourceSummary: null,
     downloadFailures: [],
-    skippedDuplicates: []
+    skippedDuplicates: [],
+    speedMode: settings.speedMode,
+    speedLabel: settings.speedLabel,
+    downloadConcurrency: settings.downloadConcurrency,
+    delayMs: settings.delayMs
   }));
   await appendJobLog({
     jobId,
@@ -195,6 +216,9 @@ async function startImageJob(payload = {}) {
     detail: {
       tabId,
       maxScrolls: settings.maxScrolls,
+      speedMode: settings.speedMode,
+      speedLabel: settings.speedLabel,
+      downloadConcurrency: settings.downloadConcurrency,
       delayMs: settings.delayMs,
       folder: settings.folder,
       accountLabel: settings.accountLabel,
@@ -291,7 +315,11 @@ async function runImageJob(jobId, tabId, settings) {
       skippedItems,
       directResourceSummary,
       downloadFailures,
-      skippedDuplicates
+      skippedDuplicates,
+      speedMode: settings.speedMode,
+      speedLabel: settings.speedLabel,
+      downloadConcurrency: settings.downloadConcurrency,
+      delayMs: settings.delayMs
     }));
     await mergeJobStatus(jobId, {
       status: "downloading",
@@ -308,6 +336,10 @@ async function runImageJob(jobId, tabId, settings) {
       scanListItems: scanList.length,
       skippedItems: skippedItems.length,
       directResourceSummary,
+      speedMode: settings.speedMode,
+      speedLabel: settings.speedLabel,
+      downloadConcurrency: settings.downloadConcurrency,
+      delayMs: settings.delayMs,
       current: matched,
       total: scanned
     });
@@ -321,6 +353,8 @@ async function runImageJob(jobId, tabId, settings) {
       startedAt: settings.startedAt,
       runId: settings.runId,
       delayMs: settings.delayMs,
+      speedMode: settings.speedMode,
+      downloadConcurrency: settings.downloadConcurrency,
       downloadMode: settings.downloadMode
     });
     submittedDownloads = Number(downloadResult.started || 0);
@@ -339,7 +373,12 @@ async function runImageJob(jobId, tabId, settings) {
         failures: downloadFailures.length,
         skippedDuplicates: skippedDuplicates.length,
         runId: downloadResult.runId,
-        runFolder: downloadResult.runFolder
+        runFolder: downloadResult.runFolder,
+        speedMode: downloadResult.speedMode,
+        speedLabel: downloadResult.speedLabel,
+        concurrency: downloadResult.concurrency,
+        delayMs: downloadResult.delayMs,
+        durationMs: downloadResult.durationMs
       }
     });
 
@@ -361,7 +400,14 @@ async function runImageJob(jobId, tabId, settings) {
       skippedItems,
       directResourceSummary,
       downloadFailures,
-      skippedDuplicates
+      skippedDuplicates,
+      speedMode: downloadResult.speedMode || settings.speedMode,
+      speedLabel: downloadResult.speedLabel || settings.speedLabel,
+      downloadConcurrency: downloadResult.concurrency || settings.downloadConcurrency,
+      delayMs: downloadResult.delayMs ?? settings.delayMs,
+      downloadDurationMs: downloadResult.durationMs,
+      downloadStartedAt: downloadResult.startedAt,
+      downloadEndedAt: downloadResult.endedAt
     });
     await saveJobReport(report);
     await appendJobLog({
@@ -383,6 +429,12 @@ async function runImageJob(jobId, tabId, settings) {
       downloadFailureCount: downloadFailures.length,
       skippedDuplicates: skippedDuplicates.length,
       skippedDuplicateCount: skippedDuplicates.length,
+      speedMode: downloadResult.speedMode || settings.speedMode,
+      speedLabel: downloadResult.speedLabel || settings.speedLabel,
+      downloadConcurrency: downloadResult.concurrency || settings.downloadConcurrency,
+      delayMs: downloadResult.delayMs ?? settings.delayMs,
+      totalDurationMs: endedAt - settings.startedAt,
+      downloadDurationMs: downloadResult.durationMs || 0,
       scannedItems,
       resolvedCardItems,
       resolvedItems,
@@ -417,6 +469,10 @@ async function runImageJob(jobId, tabId, settings) {
       directResourceSummary,
       downloadFailures,
       skippedDuplicates,
+      speedMode: settings.speedMode,
+      speedLabel: settings.speedLabel,
+      downloadConcurrency: settings.downloadConcurrency,
+      delayMs: settings.delayMs,
       diagnostic: {
         reason: error?.message || String(error),
         stage: "error"
@@ -450,6 +506,11 @@ async function runImageJob(jobId, tabId, settings) {
       downloadFailures: downloadFailures.length,
       skippedDuplicates: skippedDuplicates.length,
       skippedDuplicateCount: skippedDuplicates.length,
+      speedMode: settings.speedMode,
+      speedLabel: settings.speedLabel,
+      downloadConcurrency: settings.downloadConcurrency,
+      delayMs: settings.delayMs,
+      totalDurationMs: endedAt - settings.startedAt,
       endedAt
     });
   } finally {
@@ -556,7 +617,11 @@ async function cancelImageJob() {
     skippedItems: [],
     directResourceSummary: null,
     downloadFailures: [],
-    skippedDuplicates: []
+    skippedDuplicates: [],
+    speedMode: current.speedMode || current.settings?.speedMode || DEFAULT_SPEED_MODE,
+    speedLabel: current.speedLabel || current.settings?.speedLabel || SPEED_PRESETS[DEFAULT_SPEED_MODE].label,
+    downloadConcurrency: current.downloadConcurrency || current.settings?.downloadConcurrency || SPEED_PRESETS[DEFAULT_SPEED_MODE].concurrency,
+    delayMs: current.delayMs ?? current.settings?.delayMs ?? SPEED_PRESETS[DEFAULT_SPEED_MODE].delayMs
   }));
   await appendJobLog({
     jobId: current.id,
@@ -594,7 +659,13 @@ async function getJobStatus() {
     downloadFailures: 0,
     downloadFailureCount: 0,
     skippedDuplicates: 0,
-    skippedDuplicateCount: 0
+    skippedDuplicateCount: 0,
+    speedMode: DEFAULT_SPEED_MODE,
+    speedLabel: SPEED_PRESETS[DEFAULT_SPEED_MODE].label,
+    downloadConcurrency: SPEED_PRESETS[DEFAULT_SPEED_MODE].concurrency,
+    delayMs: SPEED_PRESETS[DEFAULT_SPEED_MODE].delayMs,
+    totalDurationMs: 0,
+    downloadDurationMs: 0
   };
 }
 
@@ -643,21 +714,54 @@ function createJobReport({
   scanList = [],
   skippedItems = [],
   directResourceSummary = null,
+  speedMode = DEFAULT_SPEED_MODE,
+  speedLabel = "",
+  downloadConcurrency = SPEED_PRESETS[DEFAULT_SPEED_MODE].concurrency,
+  delayMs = SPEED_PRESETS[DEFAULT_SPEED_MODE].delayMs,
+  downloadDurationMs = 0,
+  downloadStartedAt = null,
+  downloadEndedAt = null,
   diagnostic = null
 } = {}) {
   const normalizedSkippedDuplicates = normalizeSkippedDuplicateItems(skippedDuplicates);
+  const reportStartedAt = normalizeTimestamp(startedAt) || Date.now();
+  const reportEndedAt = endedAt ? normalizeTimestamp(endedAt) || Date.now() : null;
+  const speed = normalizeSpeedSettings({
+    speedMode,
+    delayMs,
+    downloadConcurrency
+  });
+  const normalizedDownloadStartedAt = downloadStartedAt ? normalizeTimestamp(downloadStartedAt) || null : null;
+  const normalizedDownloadEndedAt = downloadEndedAt ? normalizeTimestamp(downloadEndedAt) || null : null;
+  const normalizedDownloadDurationMs = Number(downloadDurationMs) || (
+    normalizedDownloadStartedAt && normalizedDownloadEndedAt
+      ? Math.max(normalizedDownloadEndedAt - normalizedDownloadStartedAt, 0)
+      : 0
+  );
+  const totalDurationMs = reportEndedAt ? Math.max(reportEndedAt - reportStartedAt, 0) : 0;
+  const submittedDownloadCount = Number(submittedDownloads) || 0;
 
   return {
     jobId: String(jobId || ""),
     runFolder: String(runFolder || ""),
-    startedAt: normalizeTimestamp(startedAt) || Date.now(),
-    endedAt: endedAt ? normalizeTimestamp(endedAt) || Date.now() : null,
+    startedAt: reportStartedAt,
+    endedAt: reportEndedAt,
+    totalDurationMs,
+    downloadStartedAt: normalizedDownloadStartedAt,
+    downloadEndedAt: normalizedDownloadEndedAt,
+    downloadDurationMs: normalizedDownloadDurationMs,
+    speedMode: speed.speedMode,
+    speedLabel: speedLabel || speed.speedLabel,
+    downloadConcurrency: speed.concurrency,
+    delayMs: speed.delayMs,
+    averageDownloadsPerSecond: ratePerInterval(submittedDownloadCount, normalizedDownloadDurationMs || totalDurationMs, 1000),
+    averageDownloadsPerMinute: ratePerInterval(submittedDownloadCount, normalizedDownloadDurationMs || totalDurationMs, 60000),
     scannedItems: Number(scannedItems) || 0,
     resolvedCardItems: Number(resolvedCardItems) || 0,
     resolvedItems: Number(resolvedItems) || 0,
     deduplicatedItems: Number(deduplicatedItems) || 0,
     deduplicatedItemSamples: normalizeFailureItems(deduplicatedItemSamples, "dedupe"),
-    submittedDownloads: Number(submittedDownloads) || 0,
+    submittedDownloads: submittedDownloadCount,
     parseFailures: normalizeFailureItems(parseFailures, "resolve"),
     qualityFailures: normalizeFailureItems(qualityFailures, "quality"),
     downloadFailures: normalizeFailureItems(downloadFailures, "download"),
@@ -674,6 +778,13 @@ function summarizeJobReport(report = {}) {
   return {
     jobId: report.jobId || "",
     runFolder: report.runFolder || "",
+    totalDurationMs: report.totalDurationMs || 0,
+    downloadDurationMs: report.downloadDurationMs || 0,
+    speedMode: report.speedMode || DEFAULT_SPEED_MODE,
+    speedLabel: report.speedLabel || SPEED_PRESETS[DEFAULT_SPEED_MODE].label,
+    downloadConcurrency: report.downloadConcurrency || SPEED_PRESETS[DEFAULT_SPEED_MODE].concurrency,
+    delayMs: report.delayMs ?? SPEED_PRESETS[DEFAULT_SPEED_MODE].delayMs,
+    averageDownloadsPerMinute: report.averageDownloadsPerMinute || 0,
     scannedItems: report.scannedItems || 0,
     resolvedCardItems: report.resolvedCardItems || 0,
     resolvedItems: report.resolvedItems || 0,
@@ -1016,6 +1127,7 @@ async function downloadImages(payload) {
   const accountLabel = normalizeAccountLabel(payload?.accountLabel);
   const startedAt = normalizeTimestamp(payload?.startedAt) || Date.now();
   const jobId = payload?.jobId || "";
+  const speed = normalizeSpeedSettings(payload);
   const runContext = buildRunContext({
     folder,
     accountLabel,
@@ -1024,11 +1136,13 @@ async function downloadImages(payload) {
     runId: payload?.runId
   });
   const { runId, runFolder } = runContext;
-  const delayMs = clamp(Number(payload?.delayMs) || 400, 0, 5000);
+  const delayMs = speed.delayMs;
+  const concurrency = speed.concurrency;
   const tabId = Number(payload?.tabId || 0);
   const downloadMode = normalizeDownloadMode(payload?.downloadMode);
   const shouldSkipHistory = downloadMode !== "all";
   const downloadHistory = await readDownloadHistory();
+  const downloadStartedAt = Date.now();
 
   let started = 0;
   const failures = [];
@@ -1048,324 +1162,51 @@ async function downloadImages(payload) {
       runFolder,
       total: images.length,
       downloadMode,
-      historyItems: Object.keys(downloadHistory).length
+      historyItems: Object.keys(downloadHistory).length,
+      speedMode: speed.speedMode,
+      speedLabel: speed.speedLabel,
+      concurrency,
+      delayMs
     }
   });
 
-  for (const [index, image] of images.entries()) {
-    if (!image?.url) {
-      continue;
-    }
-
-    const itemNumber = index + 1;
-    const scanIndex = normalizedScanIndex(image, itemNumber);
-    const pageOrder = Number(image.pageOrder || scanIndex || itemNumber);
-    const imageKey = buildImageKey(image);
-    const shortHash = imageKeyToShortHash(imageKey);
-    const urlSummary = summarizeDownloadUrl(image.url);
-    const previousHistoryEntry = downloadHistory[imageKey] || null;
-    if (shouldSkipHistory && previousHistoryEntry) {
-      const skippedDuplicate = createSkippedDuplicateItem({
-        index: itemNumber,
-        scanIndex,
-        pageOrder,
-        image,
-        imageKey,
-        previous: previousHistoryEntry
-      });
-      skippedDuplicates.push(skippedDuplicate);
-      await appendJobLog({
-        jobId,
-        level: "info",
-        source: "background",
-        stage: "history-dedupe",
-        message: "skippedDuplicate: image already exists in downloadHistory",
-        detail: {
-          index: itemNumber,
-          scanIndex,
-          pageOrder,
-          total: images.length,
-          imageKey,
-          shortHash,
-          source: image.source || "",
-          runFolder,
-          previousFilename: previousHistoryEntry.filename || "",
-          previousDownloadId: previousHistoryEntry.downloadId ?? null,
-          sourceUrl: image.sourceUrl || image.url || ""
-        }
-      });
-
-      continue;
-    }
-
-    await appendJobLog({
+  const results = await runDownloadQueue(
+    images.map((image, index) => ({
+      image,
+      itemNumber: index + 1
+    })),
+    concurrency,
+    (item) => processDownloadImageItem({
+      ...item,
+      total: images.length,
+      tabId,
       jobId,
-      level: "info",
-      source: "background",
-      stage: "download",
-      message: "已解析候选 URL",
-      detail: {
-        index: itemNumber,
-        scanIndex,
-        pageOrder,
-        total: images.length,
-        imageKey,
-        shortHash,
-        source: image.source || "",
-        runFolder,
-        url: urlSummary,
-        needsBlobPreparation: shouldPrepareImageInContent(image.url)
-      }
-    });
+      shouldSkipHistory,
+      downloadHistory,
+      runContext,
+      runId,
+      runFolder
+    }),
+    delayMs
+  );
 
-    try {
-      const target = await resolveDownloadTarget({
-        tabId,
-        jobId,
-        image,
-        index: itemNumber,
-        total: images.length
-      });
+  for (const result of results.sort((left, right) => left.itemNumber - right.itemNumber)) {
+    started += result.started || 0;
+    failures.push(...(result.failures || []));
+    qualityFailures.push(...(result.qualityFailures || []));
+    skippedDuplicates.push(...(result.skippedDuplicates || []));
 
-      if (!target.ok) {
-        const failureItem = buildDownloadFailureItem({
-          index: itemNumber,
-          scanIndex,
-          pageOrder,
-          image,
-          imageKey,
-          reason: target.reason,
-          stage: isQualityFailureResult(target) ? "quality-check" : "download-prepare",
-          quality: target.quality,
-          diagnostic: {
-            status: target.status || 0,
-            contentType: target.contentType || "",
-            url: target.urlSummary || urlSummary,
-            diagnostic: target.diagnostic || null,
-            quality: target.quality || null
-          }
-        });
-        if (isQualityFailureResult(target)) {
-          qualityFailures.push(failureItem);
-        } else {
-          failures.push(failureItem);
-        }
-        await appendJobLog({
-          jobId,
-          level: "warn",
-          source: "background",
-          stage: "download",
-          message: "下载前取图失败，未提交下载任务",
-          detail: {
-            index: itemNumber,
-            scanIndex,
-            pageOrder,
-            total: images.length,
-            imageKey,
-            shortHash,
-            source: image.source || "",
-            runFolder,
-            reason: target.reason,
-            status: target.status || 0,
-            contentType: target.contentType || "",
-            url: target.urlSummary || urlSummary,
-            diagnostic: target.diagnostic || null,
-            quality: target.quality || null
-          }
-        });
-
-        continue;
-      }
-
-      await appendJobLog({
-        jobId,
-        level: "info",
-        source: "background",
-        stage: "quality-check",
-        message: "quality-accepted: image passed original-quality gate",
-        detail: {
-          index: itemNumber,
-          scanIndex,
-          pageOrder,
-          total: images.length,
-          imageKey,
-          shortHash,
-          source: image.source || "",
-          runFolder,
-          quality: target.quality,
-          sourceUrl: target.sourceUrl ? summarizeDownloadUrl(target.sourceUrl) : null,
-          downloadUrlKind: target.downloadUrlKind || "blob"
-        }
-      });
-
-      const extension = sanitizeFileExtension(
-        target.extension || extensionFromMimeType(target.mimeType) || guessExtension(image.url)
-      );
-      const baseName = buildBaseName(image, itemNumber, shortHash, runContext.dateSegment);
-      const filename = `${runFolder}/${baseName}.${extension}`;
-      const submitted = await submitImageDownload({
-        tabId,
-        jobId,
-        image,
-        target,
-        filename,
-        imageKey,
-        shortHash,
-        runFolder,
-        index: itemNumber,
-        total: images.length
-      });
-
-      if (!submitted.ok) {
-        failures.push(buildDownloadFailureItem({
-          index: itemNumber,
-          scanIndex,
-          pageOrder,
-          image,
-          imageKey,
-          reason: submitted.reason,
-          stage: "download-submit",
-          quality: submitted.quality || target.quality,
-          diagnostic: {
-            filename,
-            url: urlSummary,
-            downloadUrlKind: target.downloadUrlKind || "direct",
-            quality: submitted.quality || target.quality || null
-          }
-        }));
-        await appendJobLog({
-          jobId,
-          level: "warn",
-          source: "background",
-          stage: "download",
-          message: "图片下载任务提交失败",
-          detail: {
-            index: itemNumber,
-            scanIndex,
-            pageOrder,
-            total: images.length,
-            imageKey,
-            shortHash,
-            source: image.source || "",
-            runFolder,
-            filename,
-            reason: submitted.reason,
-            url: urlSummary,
-            downloadUrlKind: target.downloadUrlKind || "direct",
-            quality: submitted.quality || target.quality || null
-          }
-        });
-        continue;
-      }
-
-      started += 1;
-      const historyEntry = createDownloadHistoryEntry({
-        image,
-        imageKey,
-        filename,
-        downloadId: submitted.downloadId,
-        sourceUrl: target.sourceUrl || image.sourceUrl || image.url || "",
-        submittedAt: Date.now()
-      });
-      downloadHistory[imageKey] = historyEntry;
-      await saveDownloadHistory(downloadHistory);
-      await appendJobLog({
-        jobId,
-        level: "info",
-        source: "background",
-        stage: "download",
-        message: "submit-original-download: browser download task submitted",
-        detail: {
-          index: itemNumber,
-          scanIndex,
-          pageOrder,
-          total: images.length,
-          filename,
-          imageKey,
-          shortHash,
-          source: image.source || "",
-          runId,
-          runFolder,
-          downloadId: submitted.downloadId,
-          downloadUrlKind: submitted.downloadUrlKind,
-          mimeType: target.mimeType || "",
-          size: target.size || 0,
-          sourceUrl: target.sourceUrl ? summarizeDownloadUrl(target.sourceUrl) : null,
-          width: target.width || 0,
-          height: target.height || 0,
-          fetchMethod: target.fetchMethod || "",
-          fallbackSource: target.fallbackSource || ""
-        }
-      });
-      await appendJobLog({
-        jobId,
-        level: "info",
-        source: "background",
-        stage: "download",
-        message: "已成功提交图片下载任务",
-        detail: {
-          index: itemNumber,
-          scanIndex,
-          pageOrder,
-          total: images.length,
-          filename,
-          imageKey,
-          shortHash,
-          source: image.source || "",
-          runId,
-          runFolder,
-          downloadId: submitted.downloadId,
-          downloadUrlKind: submitted.downloadUrlKind,
-          mimeType: target.mimeType || "",
-          size: target.size || 0,
-          sourceUrl: target.sourceUrl ? summarizeDownloadUrl(target.sourceUrl) : null,
-          width: target.width || 0,
-          height: target.height || 0,
-          quality: target.quality || null,
-          url: urlSummary,
-          fetchMethod: target.fetchMethod || "",
-          fallbackSource: target.fallbackSource || ""
-        }
-      });
-    } catch (error) {
-      const reason = error?.message || String(error);
-      failures.push(buildDownloadFailureItem({
-        index: itemNumber,
-        scanIndex,
-        pageOrder,
-        image,
-        imageKey,
-        reason,
-        stage: "download",
-        diagnostic: {
-          url: urlSummary
-        }
-      }));
-      await appendJobLog({
-        jobId,
-        level: "warn",
-        source: "background",
-        stage: "download",
-        message: "下载任务处理失败",
-        detail: {
-          index: itemNumber,
-          scanIndex,
-          pageOrder,
-          total: images.length,
-          imageKey,
-          shortHash,
-          source: image.source || "",
-          runFolder,
-          reason,
-          url: urlSummary
-        }
-      });
-    }
-
-    if (delayMs > 0 && index < images.length - 1) {
-      await sleep(delayMs);
+    if (result.historyEntry && result.imageKey) {
+      downloadHistory[result.imageKey] = result.historyEntry;
     }
   }
+
+  if (started > 0) {
+    await saveDownloadHistory(downloadHistory);
+  }
+
+  const downloadEndedAt = Date.now();
+  const durationMs = Math.max(downloadEndedAt - downloadStartedAt, 0);
 
   return {
     started,
@@ -1376,8 +1217,372 @@ async function downloadImages(payload) {
     skippedDuplicates,
     runId,
     runFolder,
-    accountLabel
+    accountLabel,
+    speedMode: speed.speedMode,
+    speedLabel: speed.speedLabel,
+    concurrency,
+    delayMs,
+    startedAt: downloadStartedAt,
+    endedAt: downloadEndedAt,
+    durationMs,
+    averageDownloadsPerSecond: ratePerInterval(started, durationMs, 1000),
+    averageDownloadsPerMinute: ratePerInterval(started, durationMs, 60000)
   };
+
+}
+
+async function runDownloadQueue(items, concurrency, worker, delayMs) {
+  const results = new Array(items.length);
+  const workerCount = Math.min(Math.max(Number(concurrency) || 1, 1), MAX_DOWNLOAD_CONCURRENCY, items.length || 1);
+  let nextIndex = 0;
+
+  async function consume() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex]);
+
+      if (delayMs > 0 && nextIndex < items.length) {
+        await sleep(delayMs);
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, consume));
+  return results.filter(Boolean);
+}
+
+async function processDownloadImageItem({
+  image,
+  itemNumber,
+  total,
+  tabId,
+  jobId,
+  shouldSkipHistory,
+  downloadHistory,
+  runContext,
+  runId,
+  runFolder
+}) {
+  const result = {
+    itemNumber,
+    started: 0,
+    failures: [],
+    qualityFailures: [],
+    skippedDuplicates: [],
+    imageKey: "",
+    historyEntry: null
+  };
+
+  if (!image?.url) {
+    return result;
+  }
+
+  const scanIndex = normalizedScanIndex(image, itemNumber);
+  const pageOrder = Number(image.pageOrder || scanIndex || itemNumber);
+  const imageKey = buildImageKey(image);
+  const shortHash = imageKeyToShortHash(imageKey);
+  const urlSummary = summarizeDownloadUrl(image.url);
+  result.imageKey = imageKey;
+
+  const previousHistoryEntry = downloadHistory[imageKey] || null;
+  if (shouldSkipHistory && previousHistoryEntry) {
+    const skippedDuplicate = createSkippedDuplicateItem({
+      index: itemNumber,
+      scanIndex,
+      pageOrder,
+      image,
+      imageKey,
+      previous: previousHistoryEntry
+    });
+    result.skippedDuplicates.push(skippedDuplicate);
+    await appendJobLog({
+      jobId,
+      level: "info",
+      source: "background",
+      stage: "history-dedupe",
+      message: "skippedDuplicate: image already exists in downloadHistory",
+      detail: {
+        index: itemNumber,
+        scanIndex,
+        pageOrder,
+        total,
+        imageKey,
+        shortHash,
+        source: image.source || "",
+        runFolder,
+        previousFilename: previousHistoryEntry.filename || "",
+        previousDownloadId: previousHistoryEntry.downloadId ?? null,
+        sourceUrl: image.sourceUrl || image.url || ""
+      }
+    });
+
+    return result;
+  }
+
+  await appendJobLog({
+    jobId,
+    level: "info",
+    source: "background",
+    stage: "download",
+    message: "已解析候选 URL",
+    detail: {
+      index: itemNumber,
+      scanIndex,
+      pageOrder,
+      total,
+      imageKey,
+      shortHash,
+      source: image.source || "",
+      runFolder,
+      url: urlSummary,
+      needsBlobPreparation: shouldPrepareImageInContent(image.url)
+    }
+  });
+
+  try {
+    const target = await resolveDownloadTarget({
+      tabId,
+      jobId,
+      image,
+      index: itemNumber,
+      total
+    });
+
+    if (!target.ok) {
+      const failureItem = buildDownloadFailureItem({
+        index: itemNumber,
+        scanIndex,
+        pageOrder,
+        image,
+        imageKey,
+        reason: target.reason,
+        stage: isQualityFailureResult(target) ? "quality-check" : "download-prepare",
+        quality: target.quality,
+        diagnostic: {
+          status: target.status || 0,
+          contentType: target.contentType || "",
+          url: target.urlSummary || urlSummary,
+          diagnostic: target.diagnostic || null,
+          quality: target.quality || null
+        }
+      });
+      if (isQualityFailureResult(target)) {
+        result.qualityFailures.push(failureItem);
+      } else {
+        result.failures.push(failureItem);
+      }
+      await appendJobLog({
+        jobId,
+        level: "warn",
+        source: "background",
+        stage: "download",
+        message: "下载前取图失败，未提交下载任务",
+        detail: {
+          index: itemNumber,
+          scanIndex,
+          pageOrder,
+          total,
+          imageKey,
+          shortHash,
+          source: image.source || "",
+          runFolder,
+          reason: target.reason,
+          status: target.status || 0,
+          contentType: target.contentType || "",
+          url: target.urlSummary || urlSummary,
+          diagnostic: target.diagnostic || null,
+          quality: target.quality || null
+        }
+      });
+
+      return result;
+    }
+
+    await appendJobLog({
+      jobId,
+      level: "info",
+      source: "background",
+      stage: "quality-check",
+      message: "quality-accepted: image passed original-quality gate",
+      detail: {
+        index: itemNumber,
+        scanIndex,
+        pageOrder,
+        total,
+        imageKey,
+        shortHash,
+        source: image.source || "",
+        runFolder,
+        quality: target.quality,
+        sourceUrl: target.sourceUrl ? summarizeDownloadUrl(target.sourceUrl) : null,
+        downloadUrlKind: target.downloadUrlKind || "blob"
+      }
+    });
+
+    const extension = sanitizeFileExtension(
+      target.extension || extensionFromMimeType(target.mimeType) || guessExtension(image.url)
+    );
+    const baseName = buildBaseName(image, itemNumber, shortHash, runContext.dateSegment);
+    const filename = `${runFolder}/${baseName}.${extension}`;
+    const submitted = await submitImageDownload({
+      tabId,
+      jobId,
+      image,
+      target,
+      filename,
+      imageKey,
+      shortHash,
+      runFolder,
+      index: itemNumber,
+      total
+    });
+
+    if (!submitted.ok) {
+      result.failures.push(buildDownloadFailureItem({
+        index: itemNumber,
+        scanIndex,
+        pageOrder,
+        image,
+        imageKey,
+        reason: submitted.reason,
+        stage: "download-submit",
+        quality: submitted.quality || target.quality,
+        diagnostic: {
+          filename,
+          url: urlSummary,
+          downloadUrlKind: target.downloadUrlKind || "direct",
+          quality: submitted.quality || target.quality || null
+        }
+      }));
+      await appendJobLog({
+        jobId,
+        level: "warn",
+        source: "background",
+        stage: "download",
+        message: "图片下载任务提交失败",
+        detail: {
+          index: itemNumber,
+          scanIndex,
+          pageOrder,
+          total,
+          imageKey,
+          shortHash,
+          source: image.source || "",
+          runFolder,
+          filename,
+          reason: submitted.reason,
+          url: urlSummary,
+          downloadUrlKind: target.downloadUrlKind || "direct",
+          quality: submitted.quality || target.quality || null
+        }
+      });
+      return result;
+    }
+
+    result.started = 1;
+    result.historyEntry = createDownloadHistoryEntry({
+      image,
+      imageKey,
+      filename,
+      downloadId: submitted.downloadId,
+      sourceUrl: target.sourceUrl || image.sourceUrl || image.url || "",
+      submittedAt: Date.now()
+    });
+    await appendJobLog({
+      jobId,
+      level: "info",
+      source: "background",
+      stage: "download",
+      message: "submit-original-download: browser download task submitted",
+      detail: {
+        index: itemNumber,
+        scanIndex,
+        pageOrder,
+        total,
+        filename,
+        imageKey,
+        shortHash,
+        source: image.source || "",
+        runId,
+        runFolder,
+        downloadId: submitted.downloadId,
+        downloadUrlKind: submitted.downloadUrlKind,
+        mimeType: target.mimeType || "",
+        size: target.size || 0,
+        sourceUrl: target.sourceUrl ? summarizeDownloadUrl(target.sourceUrl) : null,
+        width: target.width || 0,
+        height: target.height || 0,
+        fetchMethod: target.fetchMethod || "",
+        fallbackSource: target.fallbackSource || ""
+      }
+    });
+    await appendJobLog({
+      jobId,
+      level: "info",
+      source: "background",
+      stage: "download",
+      message: "已成功提交图片下载任务",
+      detail: {
+        index: itemNumber,
+        scanIndex,
+        pageOrder,
+        total,
+        filename,
+        imageKey,
+        shortHash,
+        source: image.source || "",
+        runId,
+        runFolder,
+        downloadId: submitted.downloadId,
+        downloadUrlKind: submitted.downloadUrlKind,
+        mimeType: target.mimeType || "",
+        size: target.size || 0,
+        sourceUrl: target.sourceUrl ? summarizeDownloadUrl(target.sourceUrl) : null,
+        width: target.width || 0,
+        height: target.height || 0,
+        quality: target.quality || null,
+        url: urlSummary,
+        fetchMethod: target.fetchMethod || "",
+        fallbackSource: target.fallbackSource || ""
+      }
+    });
+  } catch (error) {
+    const reason = error?.message || String(error);
+    result.failures.push(buildDownloadFailureItem({
+      index: itemNumber,
+      scanIndex,
+      pageOrder,
+      image,
+      imageKey,
+      reason,
+      stage: "download",
+      diagnostic: {
+        url: urlSummary
+      }
+    }));
+    await appendJobLog({
+      jobId,
+      level: "warn",
+      source: "background",
+      stage: "download",
+      message: "下载任务处理失败",
+      detail: {
+        index: itemNumber,
+        scanIndex,
+        pageOrder,
+        total,
+        imageKey,
+        shortHash,
+        source: image.source || "",
+        runFolder,
+        reason,
+        url: urlSummary
+      }
+    });
+  }
+
+  return result;
 }
 
 async function readDownloadHistory() {
@@ -1467,7 +1672,10 @@ async function resolveDownloadTarget({ tabId, jobId, image, index, total }) {
     total
   });
 
-  return requireDownloadTargetQuality(prepared, image);
+  return {
+    ...requireDownloadTargetQuality(prepared, image),
+    qualityChecked: true
+  };
 }
 
 function requireDownloadTargetQuality(target = {}, image = {}) {
@@ -1657,13 +1865,15 @@ async function submitImageDownload({ tabId, jobId, image, target, filename, imag
     return {
       ok: true,
       downloadId,
-      downloadUrlKind: target.downloadUrlKind || "direct"
+      downloadUrlKind: target.downloadUrlKind || "direct",
+      quality: target.quality || null
     };
   } catch (error) {
     if (target.downloadUrlKind !== "blob") {
       return {
         ok: false,
-        reason: error?.message || String(error)
+        reason: error?.message || String(error),
+        quality: target.quality || null
       };
     }
 
@@ -1671,7 +1881,8 @@ async function submitImageDownload({ tabId, jobId, image, target, filename, imag
     if (!fallback.ok) {
       return {
         ok: false,
-        reason: `${error?.message || String(error)}; data-url-fallback: ${fallback.reason}`
+        reason: `${error?.message || String(error)}; data-url-fallback: ${fallback.reason}`,
+        quality: target.quality || null
       };
     }
 
@@ -1706,12 +1917,14 @@ async function submitImageDownload({ tabId, jobId, image, target, filename, imag
       return {
         ok: true,
         downloadId,
-        downloadUrlKind: "data"
+        downloadUrlKind: "data",
+        quality: target.quality || null
       };
     } catch (fallbackError) {
       return {
         ok: false,
-        reason: `${error?.message || String(error)}; data-url-fallback: ${fallbackError?.message || String(fallbackError)}`
+        reason: `${error?.message || String(error)}; data-url-fallback: ${fallbackError?.message || String(fallbackError)}`,
+        quality: target.quality || null
       };
     }
   }
@@ -2008,6 +2221,46 @@ function normalizeAccountLabel(value) {
 
 function normalizeDownloadMode(value) {
   return String(value || "").toLowerCase() === "all" ? "all" : "new";
+}
+
+function normalizeSpeedSettings(value = {}) {
+  const speedMode = normalizeSpeedMode(value.speedMode || value.mode);
+  const preset = SPEED_PRESETS[speedMode] || SPEED_PRESETS[DEFAULT_SPEED_MODE];
+  const rawConcurrency = Number(value.downloadConcurrency ?? value.concurrency ?? preset.concurrency);
+  const rawDelayMs = Number(value.delayMs ?? preset.delayMs);
+  const concurrency = clamp(
+    Number.isFinite(rawConcurrency) ? rawConcurrency : preset.concurrency,
+    1,
+    MAX_DOWNLOAD_CONCURRENCY
+  );
+  const delayMs = clamp(
+    Number.isFinite(rawDelayMs) ? rawDelayMs : preset.delayMs,
+    0,
+    5000
+  );
+
+  return {
+    speedMode,
+    speedLabel: preset.label,
+    concurrency,
+    delayMs
+  };
+}
+
+function normalizeSpeedMode(value) {
+  const mode = String(value || DEFAULT_SPEED_MODE).toLowerCase();
+  return Object.prototype.hasOwnProperty.call(SPEED_PRESETS, mode)
+    ? mode
+    : DEFAULT_SPEED_MODE;
+}
+
+function ratePerInterval(count, durationMs, intervalMs) {
+  const duration = Number(durationMs) || 0;
+  if (duration <= 0) {
+    return 0;
+  }
+
+  return Math.round(((Number(count) || 0) * intervalMs / duration) * 100) / 100;
 }
 
 function sanitizeDateSegment(value) {

@@ -6,11 +6,22 @@ const copyFailuresButton = document.querySelector("#copy-failures");
 const copyLogsButton = document.querySelector("#copy-logs");
 const clearLogsButton = document.querySelector("#clear-logs");
 const POLL_INTERVAL_MS = 1000;
+const DEFAULT_SPEED_MODE = "standard";
+const SPEED_PRESETS = {
+  stable: { label: "稳定", concurrency: 1, delayMs: 400 },
+  standard: { label: "标准", concurrency: 2, delayMs: 100 },
+  fast: { label: "快速", concurrency: 3, delayMs: 0 }
+};
 
 let pollTimer = null;
 let latestLogs = [];
 let latestJobReport = null;
 
+document.querySelectorAll('input[name="speed-mode"]').forEach((input) => {
+  input.addEventListener("change", syncSpeedPresetControls);
+});
+
+syncSpeedPresetControls();
 restoreSettings();
 refreshJobStatus();
 refreshJobReport();
@@ -39,6 +50,8 @@ form.addEventListener("submit", async (event) => {
         accountLabel: settings.accountLabel,
         downloadMode: settings.downloadMode,
         maxScrolls: settings.maxScrolls,
+        speedMode: settings.speedMode,
+        downloadConcurrency: settings.downloadConcurrency,
         delayMs: settings.delayMs
       }
     });
@@ -130,17 +143,22 @@ async function restoreSettings() {
   document.querySelector("#folder").value = settings.folder || "ChatGPT Images";
   document.querySelector("#account-label").value = settings.accountLabel || "";
   document.querySelector("#max-scrolls").value = settings.maxScrolls ?? 30;
-  document.querySelector("#delay-ms").value = settings.delayMs ?? 400;
+  setSpeedMode(settings.speedMode || DEFAULT_SPEED_MODE);
+  syncSpeedPresetControls();
   setDownloadMode(settings.downloadMode || "new");
 }
 
 function readSettings() {
+  const speedMode = selectedSpeedMode();
+  const speedPreset = speedPresetFor(speedMode);
   return {
     folder: document.querySelector("#folder").value.trim() || "ChatGPT Images",
     accountLabel: document.querySelector("#account-label").value.trim(),
     downloadMode: selectedDownloadMode(),
+    speedMode,
+    downloadConcurrency: speedPreset.concurrency,
     maxScrolls: numberInputValue("#max-scrolls", 30),
-    delayMs: numberInputValue("#delay-ms", 0)
+    delayMs: speedPreset.delayMs
   };
 }
 
@@ -148,11 +166,46 @@ function selectedDownloadMode() {
   return document.querySelector('input[name="download-mode"]:checked')?.value === "all" ? "all" : "new";
 }
 
+function selectedSpeedMode() {
+  return normalizeSpeedMode(document.querySelector('input[name="speed-mode"]:checked')?.value);
+}
+
 function setDownloadMode(value) {
   const mode = value === "all" ? "all" : "new";
   const input = document.querySelector(`input[name="download-mode"][value="${mode}"]`);
   if (input) {
     input.checked = true;
+  }
+}
+
+function setSpeedMode(value) {
+  const mode = normalizeSpeedMode(value);
+  const input = document.querySelector(`input[name="speed-mode"][value="${mode}"]`);
+  if (input) {
+    input.checked = true;
+  }
+}
+
+function normalizeSpeedMode(value) {
+  const mode = String(value || DEFAULT_SPEED_MODE).toLowerCase();
+  return Object.prototype.hasOwnProperty.call(SPEED_PRESETS, mode)
+    ? mode
+    : DEFAULT_SPEED_MODE;
+}
+
+function speedPresetFor(value) {
+  return SPEED_PRESETS[normalizeSpeedMode(value)] || SPEED_PRESETS[DEFAULT_SPEED_MODE];
+}
+
+function syncSpeedPresetControls() {
+  const preset = speedPresetFor(selectedSpeedMode());
+  const delayInput = document.querySelector("#delay-ms");
+  const concurrencyInput = document.querySelector("#download-concurrency");
+  if (delayInput) {
+    delayInput.value = preset.delayMs;
+  }
+  if (concurrencyInput) {
+    concurrencyInput.value = preset.concurrency;
   }
 }
 
@@ -307,8 +360,26 @@ function jobMetrics(job = {}) {
   const report = latestJobReport && latestJobReport.jobId === (job.id || job.jobId)
     ? latestJobReport
     : null;
+  const speedMode = normalizeSpeedMode(job.speedMode || job.settings?.speedMode || report?.speedMode);
+  const speedPreset = speedPresetFor(speedMode);
+  const startedAt = numberMetric(job.startedAt ?? job.settings?.startedAt ?? report?.startedAt);
+  const endedAt = numberMetric(job.endedAt ?? report?.endedAt);
+  const isActive = job.status === "running" || job.status === "downloading";
+  const totalDurationMs = numberMetric(job.totalDurationMs ?? report?.totalDurationMs)
+    || (startedAt ? Math.max((endedAt || (isActive ? Date.now() : 0)) - startedAt, 0) : 0);
+  const downloadDurationMs = numberMetric(job.downloadDurationMs ?? report?.downloadDurationMs);
+  const submittedDownloads = numberMetric(job.submittedDownloads ?? job.downloadStarted ?? report?.submittedDownloads);
+  const rateDurationMs = downloadDurationMs || totalDurationMs;
 
   return {
+    speedMode,
+    speedLabel: job.speedLabel || job.settings?.speedLabel || report?.speedLabel || speedPreset.label,
+    downloadConcurrency: numberMetric(job.downloadConcurrency ?? job.settings?.downloadConcurrency ?? report?.downloadConcurrency) || speedPreset.concurrency,
+    delayMs: numberMetric(job.delayMs ?? job.settings?.delayMs ?? report?.delayMs ?? speedPreset.delayMs),
+    totalDurationMs,
+    downloadDurationMs,
+    averageDownloadsPerSecond: numberMetric(report?.averageDownloadsPerSecond) || rateMetric(submittedDownloads, rateDurationMs, 1000),
+    averageDownloadsPerMinute: numberMetric(report?.averageDownloadsPerMinute) || rateMetric(submittedDownloads, rateDurationMs, 60000),
     scanListItems: numberMetric(job.scanListItems ?? report?.scanListItems ?? report?.scanList),
     scannedItems: numberMetric(job.scannedItems ?? job.scanned ?? report?.scannedItems),
     resolvedCardItems: numberMetric(job.resolvedCardItems ?? report?.resolvedCardItems),
@@ -319,7 +390,7 @@ function jobMetrics(job = {}) {
     directAppended: directResourceMetric(job.directResourceSummary ?? report?.directResourceSummary, "appended"),
     parseFailures: numberMetric(job.parseFailureCount ?? job.detailFailureCount ?? report?.parseFailures),
     qualityFailures: numberMetric(job.qualityFailureCount ?? job.qualityFailures ?? report?.qualityFailures),
-    submittedDownloads: numberMetric(job.submittedDownloads ?? job.downloadStarted ?? report?.submittedDownloads),
+    submittedDownloads,
     skippedDuplicates: numberMetric(job.skippedDuplicateCount ?? job.skippedDuplicates ?? report?.skippedDuplicates),
     downloadFailures: numberMetric(job.downloadFailureCount ?? job.downloadFailures ?? report?.downloadFailures)
   };
@@ -342,13 +413,44 @@ function directResourceMetric(summary, key) {
   return numberMetric(summary[key]);
 }
 
+function rateMetric(count, durationMs, intervalMs) {
+  const duration = Number(durationMs) || 0;
+  if (duration <= 0) {
+    return 0;
+  }
+
+  return Math.round(((Number(count) || 0) * intervalMs / duration) * 100) / 100;
+}
+
+function formatDuration(ms) {
+  const totalSeconds = Math.max(Math.round((Number(ms) || 0) / 1000), 0);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) {
+    return `${seconds}s`;
+  }
+
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+function formatRate(value, unit) {
+  const number = Number(value) || 0;
+  return `${number.toFixed(number >= 10 ? 1 : 2).replace(/\.?0+$/, "")}${unit}`;
+}
+
 function formatMetricsLine(metrics) {
   const resolvedCardItems = metrics.resolvedCardItems
     || Math.max(metrics.scannedItems - metrics.parseFailures, metrics.resolvedItems);
   const deduplicatedItems = metrics.deduplicatedItems
     || Math.max(resolvedCardItems - metrics.resolvedItems, 0);
+  const failureCount = metrics.parseFailures + metrics.qualityFailures + metrics.downloadFailures;
 
   return [
+    `耗时 ${formatDuration(metrics.totalDurationMs)}`,
+    `平均 ${formatRate(metrics.averageDownloadsPerMinute, "张/分钟")}`,
+    `速度 ${metrics.speedLabel}`,
+    `并发 ${metrics.downloadConcurrency}`,
+    `delay ${metrics.delayMs}ms`,
     `scanList ${metrics.scanListItems || metrics.scannedItems}`,
     `质量失败 ${metrics.qualityFailures} 张`,
     `扫描 ${metrics.scannedItems} 张`,
@@ -361,6 +463,7 @@ function formatMetricsLine(metrics) {
     `跳过重复 ${metrics.skippedDuplicates} 张`,
     `已去重 ${deduplicatedItems} 张`,
     `提交下载 ${metrics.submittedDownloads} 张`,
+    `失败 ${failureCount} 张`,
     `下载提交失败 ${metrics.downloadFailures} 张`
   ].join("，") + "。";
 }
@@ -422,6 +525,14 @@ function formatFailureReportForCopy(report) {
     runFolder: report.runFolder || "",
     startedAt: report.startedAt || null,
     endedAt: report.endedAt || null,
+    totalDurationMs: numberMetric(report.totalDurationMs),
+    downloadDurationMs: numberMetric(report.downloadDurationMs),
+    speedMode: report.speedMode || DEFAULT_SPEED_MODE,
+    speedLabel: report.speedLabel || speedPresetFor(report.speedMode).label,
+    downloadConcurrency: numberMetric(report.downloadConcurrency) || speedPresetFor(report.speedMode).concurrency,
+    delayMs: numberMetric(report.delayMs),
+    averageDownloadsPerSecond: numberMetric(report.averageDownloadsPerSecond),
+    averageDownloadsPerMinute: numberMetric(report.averageDownloadsPerMinute),
     scannedItems: numberMetric(report.scannedItems),
     scanListTotal: scanList.length,
     resolvedCardItems: numberMetric(report.resolvedCardItems),

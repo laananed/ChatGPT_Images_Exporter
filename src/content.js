@@ -50,6 +50,7 @@ const IMAGE_MIME_EXTENSIONS = {
 };
 const activeScanJobs = new Set();
 const preparedImageDownloads = new Map();
+let detailOpenChain = Promise.resolve();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message?.type) {
@@ -830,6 +831,7 @@ async function resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index) 
     return derivedOriginal;
   }
 
+  return withDetailOpenLock(jobId, index, "resolve", async () => {
   const beforeHref = location.href;
   const beforeUrls = currentImageUrlSet();
 
@@ -911,6 +913,7 @@ async function resolveOriginalFromCard(card, detailOpenTimeoutMs, jobId, index) 
     height: Math.round(best.height || card.height || 0),
     source: best.source || "detail"
   };
+  });
 }
 
 async function originalFromDerivedThumbnail(card, jobId, index) {
@@ -1728,6 +1731,12 @@ async function prepareImageDownload(payload = {}) {
     });
 
     if (prepared.ok) {
+      reportLog(jobId, "info", "direct-quality-accepted: skipping detail view fallback", {
+        ...detailBase,
+        quality: prepared.quality || null,
+        sourceUrl: prepared.sourceUrl ? summarizeUrl(prepared.sourceUrl) : null,
+        downloadUrlKind: prepared.downloadUrlKind || "blob"
+      }, "download-prepare");
       return prepared;
     }
 
@@ -1902,6 +1911,7 @@ async function prepareImageFromDetailFallback({ jobId, image, url, detailBase, f
     };
   }
 
+  return withDetailOpenLock(jobId, detailBase.index, "download-prepare", async () => {
   const beforeHref = location.href;
   const beforeUrls = currentImageUrlSet();
 
@@ -1989,6 +1999,7 @@ async function prepareImageFromDetailFallback({ jobId, image, url, detailBase, f
   } finally {
     await closeDetail(beforeHref);
   }
+  });
 }
 
 async function prepareImageFromDetailCandidates({ jobId, candidates, detailBase, locationsTried }) {
@@ -3378,6 +3389,25 @@ async function checkImageReachability(url) {
       ok: true,
       reason: "head-check-failed-assume-usable"
     };
+  }
+}
+
+async function withDetailOpenLock(jobId, index, stage, task) {
+  const previous = detailOpenChain.catch(() => undefined);
+  let release = () => undefined;
+  detailOpenChain = previous.then(() => new Promise((resolve) => {
+    release = resolve;
+  }));
+
+  await previous;
+  reportLog(jobId || "", "debug", "detail-open-lock-acquired", {
+    index: index || 0
+  }, stage || "resolve");
+
+  try {
+    return await task();
+  } finally {
+    release();
   }
 }
 

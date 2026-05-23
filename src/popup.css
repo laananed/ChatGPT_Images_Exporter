@@ -65,6 +65,11 @@ input:focus {
   outline: none;
 }
 
+input[readonly] {
+  color: #596356;
+  background: #f2f4ef;
+}
+
 .grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -215,6 +220,11 @@ button.secondary:disabled {
     border-color: #3e493b;
     background: #20251f;
     color: #eef2ea;
+  }
+
+  input[readonly] {
+    color: #b7c0b2;
+    background: #1b201a;
   }
 
   fieldset {
